@@ -202,6 +202,9 @@ pub struct CompilerConfig {
     /// Currently disabled by default as the cleanup overhead at branch points
     /// exceeds the savings in typical loop patterns.
     pub enable_register_caching: bool,
+    /// Initial memory contents: (RISC-V address, data bytes)
+    /// These are written to memory during initialization before program execution.
+    pub initial_memory: Vec<(u32, Vec<u8>)>,
 }
 
 impl Default for CompilerConfig {
@@ -211,6 +214,7 @@ impl Default for CompilerConfig {
             stack_pointer: 0x80010000,
             memory_size: 0x20000, // 128KB
             enable_register_caching: false, // Disabled: overhead exceeds savings
+            initial_memory: Vec::new(),
         }
     }
 }
@@ -342,9 +346,46 @@ impl Compiler {
         // Initialize stack pointer (x2/sp)
         self.emit_store_reg_imm(2, self.config.stack_pointer);
 
+        // Initialize memory from config
+        // Clone to avoid borrow issues
+        let initial_memory = self.config.initial_memory.clone();
+        for (rv_addr, data) in initial_memory {
+            self.emit_memory_init(rv_addr, &data);
+        }
+
         // Jump to the main execution loop
         self.bytecode.jump_to("main_entry");
         self.bytecode.jumpdest("main_entry");
+    }
+
+    /// Emit code to initialize a memory region
+    /// Writes data bytes to RISC-V memory starting at rv_addr
+    fn emit_memory_init(&mut self, rv_addr: u32, data: &[u8]) {
+        // Convert RISC-V address to EVM address
+        let base_evm_addr = MEM_BASE + rv_addr.wrapping_sub(self.config.load_address);
+
+        // Write 32 bytes at a time (EVM word size)
+        let mut offset = 0u32;
+        while offset < data.len() as u32 {
+            let mut word = [0u8; 32];
+            let remaining = (data.len() as u32 - offset) as usize;
+            let chunk_size = remaining.min(32);
+
+            // Copy bytes to the beginning of the word (big-endian storage)
+            word[..chunk_size].copy_from_slice(&data[offset as usize..offset as usize + chunk_size]);
+
+            // Push the 32-byte value
+            self.bytecode.emit(Opcode::Push32);
+            self.bytecode.emit_bytes(&word);
+
+            // Push the EVM address
+            self.bytecode.push_u32(base_evm_addr + offset);
+
+            // MSTORE
+            self.bytecode.emit(Opcode::MStore);
+
+            offset += 32;
+        }
     }
 
     /// Emit halt code (returns the value in a0/x10)

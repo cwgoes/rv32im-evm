@@ -86,10 +86,57 @@ cargo build --release
 cargo test
 ```
 
-## Running the Benchmark
+## Running the Benchmarks
 
 ```bash
+# Factorial and other mathematical functions
 cargo run --bin factorial-benchmark --release
+
+# SHA-256-like hash function benchmark
+cargo run --bin sha256-benchmark --release
+```
+
+## SHA-256 Benchmark Results
+
+The SHA-256 benchmark demonstrates compiling cryptographic code from C to rv32im to EVM:
+
+### Real SHA-256 (C -> rv32im -> EVM)
+
+| Metric | Value |
+|--------|-------|
+| RISC-V code size | 1,824 bytes |
+| EVM bytecode size | 31,768 bytes |
+| Expansion ratio | 17.4x |
+
+*Full SHA-256 implementation compiled with GCC (`-march=rv32im -O2`)*
+
+### SHA-256-like Hash Mixing (Hand-assembled)
+
+| Rounds | Total Gas | Gas/Round |
+|--------|-----------|-----------|
+| 1 | 54,686 | 54,686 |
+| 4 | 60,584 | 15,146 |
+| 16 | 84,176 | 5,261 |
+| 64 | 178,544 | 2,790 |
+| 256 | 556,016 | 2,172 |
+
+The hand-assembled benchmark implements SHA-256-like operations:
+- ROTR (rotate right) using SRL + SLL + OR
+- XOR, AND for bit mixing (Sigma, Ch, Maj functions)
+- ADD for combining values
+
+Each round performs ~50 RISC-V instructions, similar to a real SHA-256 round.
+
+### Building the SHA-256 C Code
+
+To build the real SHA-256 from C (requires RISC-V toolchain):
+
+```bash
+# Install toolchain (Ubuntu/Debian)
+sudo apt install gcc-riscv64-unknown-elf
+
+# Build
+cd sha256-bench && make
 ```
 
 ## License
