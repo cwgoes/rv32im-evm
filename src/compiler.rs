@@ -680,8 +680,10 @@ impl Compiler {
                     self.stack.clear();
                 }
             } else {
-                // Not a jump target - record position normally
+                // Not a jump target, but still needs JUMPDEST for PC dispatch table
+                // The dispatch table jumps to all instruction positions
                 self.pc_to_evm.insert(*pc, self.bytecode.position());
+                self.bytecode.emit(Opcode::JumpDest);
             }
 
             // Compile the instruction
@@ -821,8 +823,10 @@ impl Compiler {
                 }
                 // Compute target: (rs1 + imm) & ~1
                 self.emit_load_reg(*rs1);
-                self.t_push_u32(*imm as u32);
-                self.t_binary_op(Opcode::Add);
+                if *imm != 0 {
+                    self.t_push_u32(*imm as u32);
+                    self.t_binary_op(Opcode::Add);
+                }
                 self.t_push_u32(0xFFFFFFFE);
                 self.t_binary_op(Opcode::And);
                 // Dynamic jump dispatch
@@ -1766,8 +1770,21 @@ impl Compiler {
     /// Helper to compute EVM address from base register and offset, leaves address on stack
     fn emit_compute_evm_addr(&mut self, base_reg: u8, offset: i32) {
         self.emit_load_reg(base_reg);
-        self.t_push_u32(offset as u32);
-        self.t_binary_op(Opcode::Add);
+        if offset >= 0 {
+            if offset != 0 {
+                self.t_push_u32(offset as u32);
+                self.t_binary_op(Opcode::Add);
+            }
+        } else {
+            // Negative offset: use SUB instead of ADD to avoid sign extension issues
+            // Stack before: [base_value]
+            // After push: [abs_offset, base_value]
+            // After swap: [base_value, abs_offset]
+            // SUB: base_value - abs_offset = base_value + offset
+            self.t_push_u32((-offset) as u32);
+            self.t_swap(1);
+            self.t_binary_op(Opcode::Sub);
+        }
         self.emit_rv_to_evm_addr();
     }
 
@@ -2365,26 +2382,44 @@ impl Compiler {
 
     /// Emit the dynamic dispatch routine for JALR
     fn emit_dynamic_dispatch(&mut self) {
+        // Debug dispatch table (disabled by default to reduce output)
+        // eprintln!("DEBUG emit_dynamic_dispatch pc_to_evm mapping:");
+        // let mut entries: Vec<_> = self.pc_to_evm.iter().collect();
+        // entries.sort_by_key(|(pc, _)| *pc);
+        // for (rv_pc, evm_pos) in &entries {
+        //     eprintln!("  PC {:#010x} -> EVM {:#06x}", rv_pc, evm_pos);
+        // }
+
         self.bytecode.jumpdest("dynamic_dispatch");
 
         // Load the target PC from memory
         self.bytecode.push_u32(PC_ADDR);
         self.bytecode.emit(Opcode::MLoad);
 
-        // Generate dispatch table
-        for (rv_pc, evm_pos) in self.pc_to_evm.iter() {
+        // Generate dispatch table using a pattern that avoids JUMPI validation issues:
+        // For each entry: if (target == rv_pc) then JUMP to evm_pos
+        // Pattern: DUP1, PUSH4 rv_pc, SUB, [next_label], JUMPI, POP, PUSH2 evm_pos, JUMP, [next_label]:
+        // This ensures JUMPI always targets a valid JUMPDEST we control
+        let mut entries: Vec<_> = self.pc_to_evm.iter().collect();
+        entries.sort_by_key(|(pc, _)| *pc);
+
+        for (i, (rv_pc, evm_pos)) in entries.iter().enumerate() {
+            let skip_label = format!("dispatch_skip_{}", i);
+
             // DUP1 (duplicate target PC)
             self.bytecode.emit(Opcode::Dup1);
             // Push RV PC to compare
-            self.bytecode.push_u32(*rv_pc);
-            self.bytecode.push1(224);
-            self.bytecode.emit(Opcode::Shl);
-            // EQ
-            self.bytecode.emit(Opcode::Eq);
-            // If equal, jump to EVM position
-            self.bytecode.push2(*evm_pos as u16);
-            self.bytecode.emit(Opcode::Swap1);
-            self.bytecode.emit(Opcode::JumpI);
+            self.bytecode.push_u32(**rv_pc);
+            // SUB - result is 0 if equal, non-zero if different
+            self.bytecode.emit(Opcode::Sub);
+            // If not equal (SUB result != 0), skip to next comparison
+            self.bytecode.jumpi_to(&skip_label);
+            // Match found! Pop the target PC and jump to destination
+            self.bytecode.emit(Opcode::Pop);
+            self.bytecode.push2(**evm_pos as u16);
+            self.bytecode.emit(Opcode::Jump);
+            // Skip label (for when comparison failed)
+            self.bytecode.jumpdest(&skip_label);
         }
 
         // If no match found, halt
