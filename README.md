@@ -12,8 +12,10 @@ This project compiles RISC-V rv32im (base integer + multiply/divide extension) b
 - Direct binary-to-bytecode compilation (no intermediate representation)
 - EVM Cancun spec support (uses PUSH0 for efficiency)
 - Comprehensive test suite (87 tests covering the rv32im spec)
-- **Optimized JUMPDEST emission** - only emits at actual jump targets (~2-3% gas savings)
-- **Register DUP optimization** - uses DUP1 when same register is loaded twice consecutively (e.g., `mul rd, rs, rs`)
+- **Optimized JUMPDEST emission** - only emits at actual jump targets
+- **Register DUP optimization** - uses DUP1 when same register is loaded twice consecutively
+- **Low-bits register storage** - eliminates SHL/SHR for register access (~30% gas savings)
+- **Selective 32-bit masking** - only masks when overflow is possible
 
 ## Usage
 
@@ -46,12 +48,12 @@ The benchmark compiles various mathematical functions from RISC-V assembly to EV
 
 | Function | Input | Result | Total Gas | Exec Gas |
 |----------|-------|--------|-----------|----------|
-| Factorial | 10! | 3,628,800 | 22,537 | 1,344 |
-| Fibonacci | fib(20) | 6,765 | 25,172 | 3,979 |
-| GCD | gcd(10000, 7777) | 1 | 22,989 | 1,796 |
-| Sum | 1+...+1000 | 500,500 | 144,286 | 123,093 |
-| Power | 2^10 | 1,024 | 22,563 | 1,370 |
-| Is Prime | 997 | prime | 28,495 | 7,302 |
+| Factorial | 10! | 3,628,800 | 22,135 | 971 |
+| Fibonacci | fib(20) | 6,765 | 23,913 | 2,749 |
+| GCD | gcd(10000, 7777) | 1 | 22,473 | 1,309 |
+| Sum | 1+...+1000 | 500,500 | 108,233 | 87,069 |
+| Power | 2^10 | 1,024 | 22,155 | 991 |
+| Is Prime | 997 | prime | 26,449 | 5,274 |
 
 *Exec Gas = Total Gas minus ~21k base overhead*
 
@@ -59,15 +61,14 @@ The benchmark compiles various mathematical functions from RISC-V assembly to EV
 
 | Loop Type | Gas/Iteration | Instructions/Iter | Gas/Instruction |
 |-----------|---------------|-------------------|-----------------|
-| Factorial (mul) | ~125 | 4 | ~31 |
-| Fibonacci (add) | ~193 | 6 | ~32 |
-| Sum (add) | ~123 | 4 | ~31 |
+| Factorial (mul) | ~89 | 4 | ~22 |
+| Fibonacci (add) | ~133 | 6 | ~22 |
+| Sum (add) | ~87 | 4 | ~22 |
 
-**Mean overhead: ~31 EVM gas per rv32im instruction**
+**Mean overhead: ~22 EVM gas per rv32im instruction**
 
 This overhead factor includes:
 - Register load/store operations (EVM memory access)
-- 32-bit value masking (EVM uses 256-bit words)
 - Control flow translation (RISC-V PC to EVM jump targets)
 
 ### Code Size Expansion
@@ -105,8 +106,8 @@ The SHA-256 benchmark demonstrates compiling cryptographic code from C to rv32im
 | Metric | Value |
 |--------|-------|
 | RISC-V code size | 1,824 bytes |
-| EVM bytecode size | 31,768 bytes |
-| Expansion ratio | 17.4x |
+| EVM bytecode size | 26,848 bytes |
+| Expansion ratio | 14.7x |
 
 *Full SHA-256 implementation compiled with GCC (`-march=rv32im -O2`)*
 
@@ -114,11 +115,11 @@ The SHA-256 benchmark demonstrates compiling cryptographic code from C to rv32im
 
 | Rounds | Total Gas | Gas/Round |
 |--------|-----------|-----------|
-| 1 | 54,686 | 54,686 |
-| 4 | 60,584 | 15,146 |
-| 16 | 84,176 | 5,261 |
-| 64 | 178,544 | 2,790 |
-| 256 | 556,016 | 2,172 |
+| 1 | 52,766 | 52,766 |
+| 4 | 56,468 | 14,117 |
+| 16 | 71,276 | 4,455 |
+| 64 | 130,508 | 2,039 |
+| 256 | 367,436 | 1,435 |
 
 The hand-assembled benchmark implements SHA-256-like operations:
 - ROTR (rotate right) using SRL + SLL + OR

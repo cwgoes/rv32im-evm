@@ -558,9 +558,14 @@ impl Compiler {
             Instruction::Addi { rd, rs1, imm } => {
                 if *rd != 0 {
                     self.emit_load_reg(*rs1);
-                    self.t_push_u32(*imm as u32);
-                    self.t_binary_op(Opcode::Add);
-                    self.emit_mask_to_32bit();
+                    if *imm != 0 {
+                        // Non-zero immediate: add and mask
+                        self.t_push_u32(*imm as u32);
+                        self.t_binary_op(Opcode::Add);
+                        self.emit_mask_to_32bit();
+                    }
+                    // imm == 0: just a register move, no add needed
+                    // (register values are already 32-bit bounded)
                     self.emit_store_reg(*rd);
                 }
             }
@@ -586,9 +591,12 @@ impl Compiler {
             Instruction::Xori { rd, rs1, imm } => {
                 if *rd != 0 {
                     self.emit_load_reg(*rs1);
-                    self.t_push_u32(*imm as u32);
-                    self.t_binary_op(Opcode::Xor);
-                    self.emit_mask_to_32bit();
+                    if *imm != 0 {
+                        self.t_push_u32(*imm as u32);
+                        self.t_binary_op(Opcode::Xor);
+                    }
+                    // No mask needed: XOR of 32-bit values is 32-bit
+                    // imm == 0: just a register move
                     self.emit_store_reg(*rd);
                 }
             }
@@ -596,9 +604,12 @@ impl Compiler {
             Instruction::Ori { rd, rs1, imm } => {
                 if *rd != 0 {
                     self.emit_load_reg(*rs1);
-                    self.t_push_u32(*imm as u32);
-                    self.t_binary_op(Opcode::Or);
-                    self.emit_mask_to_32bit();
+                    if *imm != 0 {
+                        self.t_push_u32(*imm as u32);
+                        self.t_binary_op(Opcode::Or);
+                    }
+                    // No mask needed: OR of 32-bit values is 32-bit
+                    // imm == 0: just a register move
                     self.emit_store_reg(*rd);
                 }
             }
@@ -615,9 +626,12 @@ impl Compiler {
             Instruction::Slli { rd, rs1, shamt } => {
                 if *rd != 0 {
                     self.emit_load_reg(*rs1);
-                    self.t_push1(*shamt);
-                    self.t_binary_op(Opcode::Shl);
-                    self.emit_mask_to_32bit();
+                    if *shamt != 0 {
+                        self.t_push1(*shamt);
+                        self.t_binary_op(Opcode::Shl);
+                        self.emit_mask_to_32bit();
+                    }
+                    // shamt == 0: just a register move
                     self.emit_store_reg(*rd);
                 }
             }
@@ -625,20 +639,26 @@ impl Compiler {
             Instruction::Srli { rd, rs1, shamt } => {
                 if *rd != 0 {
                     self.emit_load_reg(*rs1);
-                    self.t_push1(*shamt);
-                    self.t_binary_op(Opcode::Shr);
+                    if *shamt != 0 {
+                        self.t_push1(*shamt);
+                        self.t_binary_op(Opcode::Shr);
+                    }
+                    // shamt == 0: just a register move
                     self.emit_store_reg(*rd);
                 }
             }
 
             Instruction::Srai { rd, rs1, shamt } => {
                 if *rd != 0 {
-                    // Sign-extend to 256 bits, then arithmetic shift right
                     self.emit_load_reg(*rs1);
-                    self.emit_sign_extend_32_to_256();
-                    self.t_push1(*shamt);
-                    self.t_binary_op(Opcode::Sar);
-                    self.emit_mask_to_32bit();
+                    if *shamt != 0 {
+                        // Sign-extend to 256 bits, then arithmetic shift right
+                        self.emit_sign_extend_32_to_256();
+                        self.t_push1(*shamt);
+                        self.t_binary_op(Opcode::Sar);
+                        self.emit_mask_to_32bit();
+                    }
+                    // shamt == 0: just a register move
                     self.emit_store_reg(*rd);
                 }
             }
@@ -1012,20 +1032,17 @@ impl Compiler {
     }
 
     /// Load a register value from memory (always loads, no cache check)
+    ///
+    /// Values are stored in the low 32 bits of the EVM word, so MLOAD
+    /// returns the value directly without needing to shift.
     fn emit_load_reg_from_memory(&mut self, reg: u8) {
         let addr = REG_BASE + (reg as u32) * REG_SIZE;
         self.bytecode.push_u32(addr);
         self.bytecode.emit(Opcode::MLoad);
         // Update stack: address popped, value pushed
         self.stack.pop();
-        // Value is in the high bits, shift right to get it
-        self.bytecode.push1(224); // 256 - 32 = 224
-        self.bytecode.emit(Opcode::Shr);
-        // Update stack: binary op (shift)
-        self.stack.binary_op();
+        // Value is in low 32 bits, no shift needed
         // Mark the result as the register value
-        // We need to manually set the top entry to Register(reg)
-        self.stack.pop();
         self.stack.push_register(reg);
     }
 
@@ -1038,6 +1055,7 @@ impl Compiler {
 
     /// Store the top of stack value into a register
     ///
+    /// Values are stored in the low 32 bits of the EVM word (no shifting needed).
     /// When register caching is enabled, DUPs the value before storing so it
     /// remains on the stack for potential reuse within the same basic block.
     fn emit_store_reg(&mut self, reg: u8) {
@@ -1058,17 +1076,13 @@ impl Compiler {
                 self.t_dup(1);
                 self.cached_count += 1;
 
-                // Shift the top copy and store it
-                self.t_push1(224);
-                self.t_binary_op(Opcode::Shl);
+                // Store in low bits (no shift needed)
                 let addr = REG_BASE + (reg as u32) * REG_SIZE;
                 self.t_push_u32(addr);
                 self.t_mstore();
                 // After MSTORE, the original Register(reg) value remains on stack
             } else {
-                // Standard behavior: just store the value
-                self.t_push1(224);
-                self.t_binary_op(Opcode::Shl);
+                // Standard behavior: store in low bits (no shift needed)
                 let addr = REG_BASE + (reg as u32) * REG_SIZE;
                 self.t_push_u32(addr);
                 self.t_mstore();
@@ -1076,14 +1090,13 @@ impl Compiler {
         }
     }
 
-    /// Store an immediate value into a register
+    /// Store an immediate value into a register (stored in low 32 bits)
     fn emit_store_reg_imm(&mut self, reg: u8, value: u32) {
         // Invalidate any cached copies of this register
         self.stack.invalidate_register(reg);
         if reg != 0 {
             self.t_push_u32(value);
-            self.t_push1(224);
-            self.t_binary_op(Opcode::Shl);
+            // Store in low bits (no shift needed)
             let addr = REG_BASE + (reg as u32) * REG_SIZE;
             self.t_push_u32(addr);
             self.t_mstore();
