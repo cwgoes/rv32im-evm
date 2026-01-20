@@ -18,6 +18,7 @@ This project compiles RISC-V rv32im (base integer + multiply/divide extension) b
 - **Selective 32-bit masking** - only masks when overflow is possible
 - **Optimized memory access** - single MLOAD + BYTE extraction for word/halfword loads
 - **Branch vs zero optimization** - BNE/BEQ against zero skip unnecessary comparisons
+- **Loop-aware register caching** - keeps hot registers on EVM stack during loops (~18% gas savings)
 
 ## Usage
 
@@ -50,11 +51,11 @@ The benchmark compiles various mathematical functions from RISC-V assembly to EV
 
 | Function | Input | Result | Total Gas | Exec Gas |
 |----------|-------|--------|-----------|----------|
-| Factorial | 10! | 3,628,800 | 22,113 | 949 |
-| Fibonacci | fib(20) | 6,765 | 23,871 | 2,707 |
-| GCD | gcd(10000, 7777) | 1 | 22,453 | 1,289 |
-| Sum | 1+...+1000 | 500,500 | 106,231 | 85,067 |
-| Power | 2^10 | 1,024 | 22,133 | 969 |
+| Factorial | 10! | 3,628,800 | 22,006 | 842 |
+| Fibonacci | fib(20) | 6,765 | 23,488 | 2,324 |
+| GCD | gcd(10000, 7777) | 1 | 22,309 | 1,145 |
+| Sum | 1+...+1000 | 500,500 | 92,264 | 71,100 |
+| Power | 2^10 | 1,024 | 22,056 | 892 |
 | Is Prime | 997 | prime | 26,389 | 5,225 |
 
 *Exec Gas = Total Gas minus ~21k base overhead*
@@ -63,15 +64,16 @@ The benchmark compiles various mathematical functions from RISC-V assembly to EV
 
 | Loop Type | Gas/Iteration | Instructions/Iter | Gas/Instruction |
 |-----------|---------------|-------------------|-----------------|
-| Factorial (mul) | ~87 | 4 | ~22 |
-| Fibonacci (add) | ~131 | 6 | ~22 |
-| Sum (add) | ~85 | 4 | ~21 |
+| Factorial (mul) | ~73 | 4 | ~18 |
+| Fibonacci (add) | ~109 | 6 | ~18 |
+| Sum (add) | ~71 | 4 | ~18 |
 
-**Mean overhead: ~21-22 EVM gas per rv32im instruction**
+**Mean overhead: ~18 EVM gas per rv32im instruction**
 
 This overhead factor includes:
-- Register load/store operations (EVM memory access)
+- Register load/store operations (optimized with DUP for hot registers in loops)
 - Control flow translation (RISC-V PC to EVM jump targets)
+- 32-bit masking for arithmetic operations (RISC-V semantics require wraparound)
 
 ### Code Size Expansion
 

@@ -218,6 +218,15 @@ impl EvmBytecode {
         self
     }
 
+    /// Patch bytes at a specific position (for resolving forward references)
+    pub fn patch(&mut self, position: usize, bytes: &[u8]) {
+        for (i, &byte) in bytes.iter().enumerate() {
+            if position + i < self.bytecode.len() {
+                self.bytecode[position + i] = byte;
+            }
+        }
+    }
+
     /// Emit a raw byte
     pub fn emit_byte(&mut self, byte: u8) -> &mut Self {
         self.bytecode.push(byte);

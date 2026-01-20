@@ -158,6 +158,14 @@ impl StackModel {
         }
     }
 
+    /// Mark the top of stack as a specific register value
+    /// Used by loop optimization when we update a hot register on the stack
+    fn mark_top_as_register(&mut self, reg: u8) {
+        if let Some(top) = self.entries.last_mut() {
+            *top = StackEntry::Register(reg);
+        }
+    }
+
     /// Clear the entire stack model (at basic block boundaries)
     fn clear(&mut self) {
         self.entries.clear();
@@ -177,6 +185,325 @@ impl StackModel {
     #[allow(dead_code)]
     fn depth(&self) -> usize {
         self.entries.len()
+    }
+}
+
+// ============================================================
+// Loop Detection and Analysis
+// ============================================================
+
+/// Information about a detected loop
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct LoopInfo {
+    /// PC of the loop header (target of back edge)
+    header_pc: u32,
+    /// PC of the back edge instruction (branch that jumps backward)
+    back_edge_pc: u32,
+    /// PCs of all instructions in the loop body (from header to back edge)
+    body_pcs: Vec<u32>,
+    /// Registers that are read in the loop
+    regs_read: Vec<u8>,
+    /// Registers that are written in the loop
+    regs_written: Vec<u8>,
+    /// "Hot" registers - both read and written, candidates for stack allocation
+    hot_regs: Vec<u8>,
+    /// For while-loops: PC of the conditional exit branch (jumps forward out of loop)
+    exit_branch_pc: Option<u32>,
+    /// For while-loops: target PC of the exit branch
+    exit_target_pc: Option<u32>,
+    /// True if this is a while-loop (JAL back edge), false if do-while (conditional back edge)
+    is_while_loop: bool,
+}
+
+impl LoopInfo {
+    /// Analyze register usage for a set of instructions in the loop
+    fn analyze_registers(instructions: &[(u32, Instruction)], header_pc: u32, back_edge_pc: u32) -> Self {
+        use std::collections::HashSet;
+
+        let mut regs_read: HashSet<u8> = HashSet::new();
+        let mut regs_written: HashSet<u8> = HashSet::new();
+        let mut body_pcs = Vec::new();
+
+        // Collect instructions in the loop body (from header to back edge inclusive)
+        for (pc, instr) in instructions {
+            if *pc >= header_pc && *pc <= back_edge_pc {
+                body_pcs.push(*pc);
+
+                // Analyze register reads and writes
+                let (reads, writes) = Self::get_reg_usage(instr);
+                for r in reads {
+                    if r != 0 { regs_read.insert(r); }
+                }
+                for w in writes {
+                    if w != 0 { regs_written.insert(w); }
+                }
+            }
+        }
+
+        // Hot registers are those that are both read and written
+        // Sort for deterministic ordering (HashSet iteration order is arbitrary)
+        let mut hot_regs: Vec<u8> = regs_read.intersection(&regs_written)
+            .copied()
+            .collect();
+        hot_regs.sort();
+
+        LoopInfo {
+            header_pc,
+            back_edge_pc,
+            body_pcs,
+            regs_read: regs_read.into_iter().collect(),
+            regs_written: regs_written.into_iter().collect(),
+            hot_regs,
+            exit_branch_pc: None,
+            exit_target_pc: None,
+            is_while_loop: false,
+        }
+    }
+
+    /// Get registers read and written by an instruction
+    fn get_reg_usage(instr: &Instruction) -> (Vec<u8>, Vec<u8>) {
+        match instr {
+            // R-type: reads rs1, rs2; writes rd
+            Instruction::Add { rd, rs1, rs2 } |
+            Instruction::Sub { rd, rs1, rs2 } |
+            Instruction::Xor { rd, rs1, rs2 } |
+            Instruction::Or { rd, rs1, rs2 } |
+            Instruction::And { rd, rs1, rs2 } |
+            Instruction::Sll { rd, rs1, rs2 } |
+            Instruction::Srl { rd, rs1, rs2 } |
+            Instruction::Sra { rd, rs1, rs2 } |
+            Instruction::Slt { rd, rs1, rs2 } |
+            Instruction::Sltu { rd, rs1, rs2 } |
+            Instruction::Mul { rd, rs1, rs2 } |
+            Instruction::Mulh { rd, rs1, rs2 } |
+            Instruction::Mulhsu { rd, rs1, rs2 } |
+            Instruction::Mulhu { rd, rs1, rs2 } |
+            Instruction::Div { rd, rs1, rs2 } |
+            Instruction::Divu { rd, rs1, rs2 } |
+            Instruction::Rem { rd, rs1, rs2 } |
+            Instruction::Remu { rd, rs1, rs2 } => {
+                (vec![*rs1, *rs2], vec![*rd])
+            }
+
+            // I-type arithmetic: reads rs1; writes rd
+            Instruction::Addi { rd, rs1, .. } |
+            Instruction::Xori { rd, rs1, .. } |
+            Instruction::Ori { rd, rs1, .. } |
+            Instruction::Andi { rd, rs1, .. } |
+            Instruction::Slli { rd, rs1, .. } |
+            Instruction::Srli { rd, rs1, .. } |
+            Instruction::Srai { rd, rs1, .. } |
+            Instruction::Slti { rd, rs1, .. } |
+            Instruction::Sltiu { rd, rs1, .. } => {
+                (vec![*rs1], vec![*rd])
+            }
+
+            // Load instructions: reads rs1 (base); writes rd
+            Instruction::Lb { rd, rs1, .. } |
+            Instruction::Lh { rd, rs1, .. } |
+            Instruction::Lw { rd, rs1, .. } |
+            Instruction::Lbu { rd, rs1, .. } |
+            Instruction::Lhu { rd, rs1, .. } => {
+                (vec![*rs1], vec![*rd])
+            }
+
+            // Store instructions: reads rs1 (base), rs2 (value); no write
+            Instruction::Sb { rs1, rs2, .. } |
+            Instruction::Sh { rs1, rs2, .. } |
+            Instruction::Sw { rs1, rs2, .. } => {
+                (vec![*rs1, *rs2], vec![])
+            }
+
+            // Branch instructions: reads rs1, rs2; no write
+            Instruction::Beq { rs1, rs2, .. } |
+            Instruction::Bne { rs1, rs2, .. } |
+            Instruction::Blt { rs1, rs2, .. } |
+            Instruction::Bge { rs1, rs2, .. } |
+            Instruction::Bltu { rs1, rs2, .. } |
+            Instruction::Bgeu { rs1, rs2, .. } => {
+                (vec![*rs1, *rs2], vec![])
+            }
+
+            // LUI/AUIPC: no read; writes rd
+            Instruction::Lui { rd, .. } |
+            Instruction::Auipc { rd, .. } => {
+                (vec![], vec![*rd])
+            }
+
+            // JAL: no read; writes rd (link register)
+            Instruction::Jal { rd, .. } => {
+                (vec![], vec![*rd])
+            }
+
+            // JALR: reads rs1; writes rd
+            Instruction::Jalr { rd, rs1, .. } => {
+                (vec![*rs1], vec![*rd])
+            }
+
+            // System instructions
+            Instruction::Ecall | Instruction::Ebreak | Instruction::Fence { .. } => {
+                (vec![], vec![])
+            }
+
+            Instruction::Unknown { .. } => (vec![], vec![]),
+        }
+    }
+
+    /// Check if this loop is suitable for stack-based optimization
+    /// Returns true if:
+    /// - Loop has 2-6 hot registers (can fit in DUP range)
+    /// - Loop is not too large (< 20 instructions)
+    /// - Back edge is a conditional branch (so exit is via fallthrough)
+    fn is_optimizable(&self) -> bool {
+        let hot_count = self.hot_regs.len();
+        hot_count >= 1 && hot_count <= 6 && self.body_pcs.len() <= 20
+    }
+
+    /// Check if the back edge is a conditional branch (not JAL/J)
+    #[allow(dead_code)]
+    fn has_conditional_back_edge(instructions: &[(u32, Instruction)], back_edge_pc: u32) -> bool {
+        for (pc, instr) in instructions {
+            if *pc == back_edge_pc {
+                return matches!(instr,
+                    Instruction::Beq { .. } |
+                    Instruction::Bne { .. } |
+                    Instruction::Blt { .. } |
+                    Instruction::Bge { .. } |
+                    Instruction::Bltu { .. } |
+                    Instruction::Bgeu { .. }
+                );
+            }
+        }
+        false
+    }
+}
+
+/// Find the exit branch in a while-loop (conditional forward jump out of the loop)
+/// Returns (exit_branch_pc, exit_target_pc) if there is exactly ONE exit branch.
+/// Returns (None, None) if there are multiple exits (not optimizable) or no exits.
+fn find_exit_branch(instructions: &[(u32, Instruction)], header_pc: u32, back_edge_pc: u32) -> (Option<u32>, Option<u32>) {
+    let mut exit_branches = Vec::new();
+
+    // Look for conditional branches within the loop that jump forward past the back edge
+    for (pc, instr) in instructions {
+        if *pc >= header_pc && *pc < back_edge_pc {
+            let target = match instr {
+                Instruction::Beq { imm, .. } |
+                Instruction::Bne { imm, .. } |
+                Instruction::Blt { imm, .. } |
+                Instruction::Bge { imm, .. } |
+                Instruction::Bltu { imm, .. } |
+                Instruction::Bgeu { imm, .. } => {
+                    Some(pc.wrapping_add(*imm as u32))
+                }
+                _ => None,
+            };
+
+            if let Some(target_pc) = target {
+                // Forward jump past the back edge = loop exit
+                if target_pc > back_edge_pc {
+                    exit_branches.push((*pc, target_pc));
+                }
+            }
+        }
+    }
+
+    // Only optimize if there's exactly one exit branch
+    // Multiple exits are too complex to handle with the current approach
+    if exit_branches.len() == 1 {
+        (Some(exit_branches[0].0), Some(exit_branches[0].1))
+    } else {
+        (None, None)
+    }
+}
+
+/// Detect loops in the instruction stream
+/// Handles two patterns:
+/// 1. Do-while loops: conditional back edge (BEQ/BNE jumping backward)
+/// 2. While loops: JAL back edge + conditional forward exit branch
+fn detect_loops(instructions: &[(u32, Instruction)], load_address: u32) -> Vec<LoopInfo> {
+    let mut loops = Vec::new();
+
+    for (pc, instr) in instructions {
+        // Pattern 1: JAL back edge (while-loop)
+        // The exit is via a conditional forward branch inside the loop
+        if let Instruction::Jal { rd, imm } = instr {
+            if *rd == 0 {  // J pseudo-instruction (jal x0, offset)
+                let target_pc = pc.wrapping_add(*imm as u32);
+                if target_pc < *pc && target_pc >= load_address {
+                    // Find the conditional exit branch
+                    let (exit_branch_pc, exit_target_pc) = find_exit_branch(instructions, target_pc, *pc);
+
+                    // Only optimize if we found a clear exit branch
+                    if exit_branch_pc.is_some() {
+                        let mut loop_info = LoopInfo::analyze_registers(instructions, target_pc, *pc);
+                        loop_info.exit_branch_pc = exit_branch_pc;
+                        loop_info.exit_target_pc = exit_target_pc;
+                        loop_info.is_while_loop = true;
+                        if loop_info.is_optimizable() {
+                            loops.push(loop_info);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pattern 2: Conditional back edge (do-while loop)
+        // The exit is via fallthrough when branch not taken
+        let target = match instr {
+            Instruction::Beq { imm, .. } |
+            Instruction::Bne { imm, .. } |
+            Instruction::Blt { imm, .. } |
+            Instruction::Bge { imm, .. } |
+            Instruction::Bltu { imm, .. } |
+            Instruction::Bgeu { imm, .. } => {
+                Some(pc.wrapping_add(*imm as u32))
+            }
+            _ => None,
+        };
+
+        if let Some(target_pc) = target {
+            // Backward branch = do-while loop
+            if target_pc < *pc && target_pc >= load_address {
+                let mut loop_info = LoopInfo::analyze_registers(instructions, target_pc, *pc);
+                loop_info.is_while_loop = false;
+                if loop_info.is_optimizable() {
+                    loops.push(loop_info);
+                }
+            }
+        }
+    }
+
+    loops
+}
+
+/// Stack layout for loop optimization
+/// Maps hot registers to their fixed positions on the EVM stack
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct LoopStackLayout {
+    /// Register to stack depth mapping (depth 1 = top)
+    reg_to_depth: HashMap<u8, usize>,
+    /// Total number of registers on stack
+    count: usize,
+}
+
+impl LoopStackLayout {
+    fn new(hot_regs: &[u8]) -> Self {
+        let mut reg_to_depth = HashMap::new();
+        // Assign depths from 1 (top) upward
+        for (i, reg) in hot_regs.iter().enumerate() {
+            reg_to_depth.insert(*reg, i + 1);
+        }
+        LoopStackLayout {
+            reg_to_depth,
+            count: hot_regs.len(),
+        }
+    }
+
+    fn get_depth(&self, reg: u8) -> Option<usize> {
+        self.reg_to_depth.get(&reg).copied()
     }
 }
 
@@ -232,6 +559,15 @@ pub struct Compiler {
     /// Number of cached register values currently on the EVM stack
     /// These need to be cleaned up at basic block boundaries
     cached_count: usize,
+    /// Detected loops that can be optimized
+    detected_loops: Vec<LoopInfo>,
+    /// Currently active loop optimization (if any)
+    active_loop: Option<LoopInfo>,
+    /// Stack layout for the active loop
+    loop_stack_layout: Option<LoopStackLayout>,
+    /// For while-loops: placeholder positions that need to jump to exit block
+    /// (placeholder_position, actual_exit_target_pc)
+    while_loop_exit_jumps: Vec<(usize, u32)>,
 }
 
 impl Compiler {
@@ -249,6 +585,10 @@ impl Compiler {
             pending_jumps: Vec::new(),
             stack: StackModel::new(),
             cached_count: 0,
+            detected_loops: Vec::new(),
+            active_loop: None,
+            loop_stack_layout: None,
+            while_loop_exit_jumps: Vec::new(),
         }
     }
 
@@ -299,24 +639,46 @@ impl Compiler {
             }
         }
 
+        // Detect loops for optimization
+        self.detected_loops = detect_loops(&instructions, self.config.load_address);
+
         // Emit initialization code
         self.emit_init();
 
         // Second pass: compile each instruction
         for (pc, instr) in &instructions {
+            // Check if we're at a loop header
+            let loop_at_header = self.get_loop_at_header(*pc).cloned();
+
+            // Check if we're at a back edge (will be handled after instruction)
+            let loop_at_back_edge = self.get_loop_at_back_edge(*pc).cloned();
+
             // Only emit JUMPDEST for actual jump targets
             let is_jump_target = jump_targets.contains(pc);
+
             if is_jump_target {
                 // Clean up any cached values from previous basic block
                 // (this happens BEFORE the JUMPDEST for the fallthrough path)
                 self.cleanup_cached_values();
+
+                // If this is a loop header, emit prologue BEFORE the JUMPDEST
+                // This way: entry path executes prologue then JUMPDEST
+                //           back edge jumps to JUMPDEST directly (regs already on stack)
+                if let Some(ref loop_info) = loop_at_header {
+                    self.emit_loop_prologue(loop_info);
+                }
+
                 // Record the EVM position BEFORE emitting JUMPDEST
                 // This ensures jump targets point to the JUMPDEST instruction
                 self.pc_to_evm.insert(*pc, self.bytecode.position());
                 self.bytecode.emit(Opcode::JumpDest);
-                // Clear stack model at basic block boundaries
-                // We can't know stack state when jumping from other locations
-                self.stack.clear();
+
+                // For loop headers, DON'T clear stack - hot regs are on stack
+                if loop_at_header.is_none() {
+                    // Clear stack model at basic block boundaries
+                    // We can't know stack state when jumping from other locations
+                    self.stack.clear();
+                }
             } else {
                 // Not a jump target - record position normally
                 self.pc_to_evm.insert(*pc, self.bytecode.position());
@@ -325,6 +687,25 @@ impl Compiler {
             // Compile the instruction
             // Stack model carries over within basic blocks for cross-instruction caching
             self.compile_instruction(*pc, instr)?;
+
+            #[cfg(test)]
+            if self.active_loop.is_some() {
+                println!("DEBUG after compile PC {:#x}: stack len={}", *pc, self.stack.entries.len());
+            }
+
+            // If this was a back edge instruction, handle loop exit
+            if loop_at_back_edge.is_some() && self.active_loop.is_some() {
+                let is_while_loop = self.active_loop.as_ref().map_or(false, |l| l.is_while_loop);
+                if is_while_loop {
+                    // For while-loops: emit exit block (JUMPDEST + epilogue + JUMP to exit)
+                    // The exit branch jumps here, then we go to actual exit target
+                    self.emit_while_loop_exit_block();
+                } else {
+                    // For do-while loops: emit epilogue for fallthrough exit path
+                    // When the conditional back edge is NOT taken, we fall through here
+                    self.emit_loop_epilogue();
+                }
+            }
         }
 
         // Emit halt/return code
@@ -925,6 +1306,7 @@ impl Compiler {
     }
 
     /// Push a 2-byte value onto the stack (tracked)
+    #[allow(dead_code)]
     fn t_push2(&mut self, value: u16) {
         self.bytecode.push2(value);
         self.stack.push_unknown();
@@ -1036,12 +1418,241 @@ impl Compiler {
     }
 
     // ============================================================
+    // Loop Optimization Helpers
+    // ============================================================
+
+    /// Check if the given PC is at the start of an optimized loop
+    fn get_loop_at_header(&self, pc: u32) -> Option<&LoopInfo> {
+        self.detected_loops.iter().find(|l| l.header_pc == pc)
+    }
+
+    /// Check if the given PC is the back edge of an optimized loop
+    fn get_loop_at_back_edge(&self, pc: u32) -> Option<&LoopInfo> {
+        self.detected_loops.iter().find(|l| l.back_edge_pc == pc)
+    }
+
+    /// Check if the given PC is the exit branch of a while-loop
+    /// Returns Some((actual_exit_target_pc)) if this is an exit branch
+    #[allow(dead_code)]
+    fn get_while_loop_exit_info(&self, pc: u32) -> Option<u32> {
+        if let Some(ref active) = self.active_loop {
+            if active.is_while_loop && active.exit_branch_pc == Some(pc) {
+                return active.exit_target_pc;
+            }
+        }
+        None
+    }
+
+    /// Check if we're currently in an optimized loop and the register is hot
+    #[allow(dead_code)]
+    fn is_hot_register(&self, reg: u8) -> bool {
+        if let Some(ref layout) = self.loop_stack_layout {
+            layout.get_depth(reg).is_some()
+        } else {
+            false
+        }
+    }
+
+    /// Restore hot registers to the stack model after internal control flow merge
+    /// When in a loop, internal control flow (like div-by-zero checks) clears the stack model.
+    /// We need to restore it to reflect the actual EVM stack state (hot regs are still there).
+    fn restore_hot_regs_in_stack_model(&mut self) {
+        self.stack.clear();
+        // If in a loop, restore the hot registers in the correct order
+        if let Some(ref active) = self.active_loop {
+            // hot_regs are ordered so that when loaded in reverse, the first ends up on top
+            // Stack after prologue: [last_hot_reg, ..., first_hot_reg] with first on top
+            for reg in active.hot_regs.iter().rev() {
+                self.stack.push_register(*reg);
+            }
+        }
+    }
+
+    /// Emit loop prologue: load hot registers onto the EVM stack
+    /// Stack layout: [reg_n, ..., reg_2, reg_1] with reg_1 on top
+    fn emit_loop_prologue(&mut self, loop_info: &LoopInfo) {
+        #[cfg(test)]
+        println!("DEBUG prologue: BEFORE, stack len={}", self.stack.entries.len());
+        // Load hot registers in reverse order so the first one ends up on top
+        for reg in loop_info.hot_regs.iter().rev() {
+            self.emit_load_reg_from_memory(*reg);
+            #[cfg(test)]
+            println!("DEBUG prologue: after loading reg {}, stack len={}", reg, self.stack.entries.len());
+        }
+        // Set up the stack layout
+        self.loop_stack_layout = Some(LoopStackLayout::new(&loop_info.hot_regs));
+        self.active_loop = Some(loop_info.clone());
+        #[cfg(test)]
+        println!("DEBUG prologue: AFTER, stack len={}", self.stack.entries.len());
+    }
+
+    /// Emit loop epilogue: store hot registers back to memory and clean up stack
+    fn emit_loop_epilogue(&mut self) {
+        if let Some(ref layout) = self.loop_stack_layout.clone() {
+            // Store each hot register from stack back to memory
+            // We need to be careful about stack order
+            // Stack: [reg_n, ..., reg_2, reg_1] with reg_1 on top
+            // Store from top to bottom
+
+            // Get registers in order (depth 1 first = top of stack)
+            let mut regs: Vec<(u8, usize)> = layout.reg_to_depth.iter()
+                .map(|(r, d)| (*r, *d))
+                .collect();
+            regs.sort_by_key(|(_, d)| *d);
+
+            #[cfg(test)]
+            println!("DEBUG Epilogue: stack model len={}, regs={:?}", self.stack.entries.len(), regs);
+
+            for (reg, depth) in &regs {
+                // The top of stack is the register we want to store
+                // Stack: [..., reg_value], PUSH addr -> [..., reg_value, addr]
+                // MSTORE expects (value, offset) with offset on top
+                // MSTORE: stores reg_value at memory[addr]
+                let addr = REG_BASE + (*reg as u32) * REG_SIZE;
+                #[cfg(test)]
+                println!("DEBUG Epilogue: storing reg {} (depth {}) to addr {}", reg, depth, addr);
+                let _ = depth; // Suppress unused warning in release mode
+                self.bytecode.push_u32(addr);
+                self.bytecode.emit(Opcode::MStore);
+            }
+
+            // Clear loop state
+            self.loop_stack_layout = None;
+            self.active_loop = None;
+            self.stack.clear();
+        }
+    }
+
+    /// Emit while-loop exit block: JUMPDEST + epilogue + JUMP to actual exit
+    /// This is called after the back edge for while-loops
+    /// The exit branch jumps here, then we flush regs and jump to actual exit target
+    fn emit_while_loop_exit_block(&mut self) {
+        // Record the exit block's position for resolving exit jumps
+        let exit_block_position = self.bytecode.position();
+
+        #[cfg(test)]
+        println!("DEBUG emit_while_loop_exit_block: position={}, exit_jumps_count={}",
+                 exit_block_position, self.while_loop_exit_jumps.len());
+
+        // Emit JUMPDEST for the exit block
+        self.bytecode.emit(Opcode::JumpDest);
+
+        // Get the actual exit target before clearing loop state
+        let actual_exit_target = if let Some(ref active) = self.active_loop {
+            active.exit_target_pc
+        } else {
+            None
+        };
+
+        // Emit epilogue (same as emit_loop_epilogue, but inline)
+        if let Some(ref layout) = self.loop_stack_layout.clone() {
+            let mut regs: Vec<(u8, usize)> = layout.reg_to_depth.iter()
+                .map(|(r, d)| (*r, *d))
+                .collect();
+            regs.sort_by_key(|(_, d)| *d);
+
+            for (reg, _depth) in &regs {
+                let addr = REG_BASE + (*reg as u32) * REG_SIZE;
+                self.bytecode.push_u32(addr);
+                self.bytecode.emit(Opcode::MStore);
+            }
+        }
+
+        // Emit JUMP to actual exit target
+        if let Some(target_pc) = actual_exit_target {
+            self.bytecode.emit(Opcode::Push2);
+            self.pending_jumps.push((self.bytecode.position(), target_pc));
+            self.bytecode.emit_bytes(&[0, 0]); // Placeholder
+            self.bytecode.emit(Opcode::Jump);
+        }
+
+        // Now resolve all the while_loop_exit_jumps to point to exit_block_position
+        for (placeholder_pos, _actual_target) in self.while_loop_exit_jumps.drain(..) {
+            let target_bytes = (exit_block_position as u16).to_be_bytes();
+            #[cfg(test)]
+            println!("DEBUG: patching placeholder at {} to point to exit_block {}", placeholder_pos, exit_block_position);
+            self.bytecode.patch(placeholder_pos, &target_bytes);
+        }
+
+        // Clear loop state
+        self.loop_stack_layout = None;
+        self.active_loop = None;
+        self.stack.clear();
+    }
+
+    /// Load a register in loop-optimized mode
+    /// For hot registers, we rely on the stack model's find_register
+    /// to find the current position (since it may change as we compute)
+    fn emit_load_reg_loop_optimized(&mut self, _reg: u8) -> bool {
+        // Always return false - let the normal emit_load_reg path handle it
+        // The stack model's find_register will correctly find hot registers
+        // because we push them during prologue and maintain them on the stack
+        false
+    }
+
+    /// Store a register value in loop-optimized mode
+    /// Updates the value on the stack instead of storing to memory
+    /// Stack before: [...hot_regs..., ..., new_value]
+    /// Stack after: [...hot_regs_updated..., ...]
+    fn emit_store_reg_loop_optimized(&mut self, reg: u8) -> bool {
+        if reg == 0 {
+            self.t_pop();
+            return true;
+        }
+
+        // Check if we're in an optimized loop and this is a hot register
+        if self.active_loop.is_none() {
+            return false;
+        }
+
+        // Only optimize hot registers
+        let is_hot = if let Some(ref layout) = self.loop_stack_layout {
+            layout.get_depth(reg).is_some()
+        } else {
+            false
+        };
+
+        if !is_hot {
+            return false;
+        }
+
+        // Find where the OLD value of this register is on the stack
+        if let Some(old_depth) = self.stack.find_register(reg) {
+            // Stack: [..., old_reg@depth, ..., new_value@top]
+            // new_value is at depth 1, old_reg is at depth old_depth
+
+            if old_depth > 1 && old_depth <= 16 {
+                // First, mark the new value (top of stack) as this register
+                self.stack.mark_top_as_register(reg);
+
+                // SWAP to exchange new_reg (top) with old_reg (at old_depth)
+                // SWAP(n) swaps top with element at depth n+1
+                // To swap depth 1 with depth old_depth, use SWAP(old_depth - 1)
+                let swap_depth = old_depth - 1;
+                self.t_swap(swap_depth);
+
+                // Now: [..., new_reg, ..., old_reg]
+                // POP removes the old_reg (now at top)
+                self.t_pop();
+
+                return true;
+            }
+        }
+        false
+    }
+
+    // ============================================================
     // Helper methods for register access
     // ============================================================
 
     /// Load a register value onto the EVM stack
-    /// Uses DUP when the register value is already on the stack
+    /// Uses loop-optimized DUP when in an optimized loop, otherwise normal load
     fn emit_load_reg(&mut self, reg: u8) {
+        // Check for loop optimization first
+        if self.emit_load_reg_loop_optimized(reg) {
+            return;
+        }
+
         if reg == 0 {
             // x0 is always 0
             self.t_push0();
@@ -1060,7 +1671,8 @@ impl Compiler {
     /// returns the value directly without needing to shift.
     fn emit_load_reg_from_memory(&mut self, reg: u8) {
         let addr = REG_BASE + (reg as u32) * REG_SIZE;
-        self.bytecode.push_u32(addr);
+        // Use t_push_u32 to properly update stack model
+        self.t_push_u32(addr);
         self.bytecode.emit(Opcode::MLoad);
         // Update stack: address popped, value pushed
         self.stack.pop();
@@ -1082,6 +1694,11 @@ impl Compiler {
     /// When register caching is enabled, DUPs the value before storing so it
     /// remains on the stack for potential reuse within the same basic block.
     fn emit_store_reg(&mut self, reg: u8) {
+        // Check for loop optimization first
+        if self.emit_store_reg_loop_optimized(reg) {
+            return;
+        }
+
         if reg == 0 {
             // Writing to x0 is a no-op, just pop the value
             self.t_pop();
@@ -1503,22 +2120,22 @@ impl Compiler {
         self.t_binary_op(Opcode::SDiv);
         self.emit_mask_to_32bit();
         self.bytecode.jump_to(&end_label);
-        self.stack.clear(); // After jump, stack state unknown
+        self.restore_hot_regs_in_stack_model();
 
         // Division by zero: return -1
         self.bytecode.jumpdest(&format!("{}_zero", div_label));
-        self.stack.clear(); // Jump target - clear stack model
+        self.restore_hot_regs_in_stack_model();
         self.t_push4(0xFFFFFFFF);
         self.bytecode.jump_to(&end_label);
-        self.stack.clear();
+        self.restore_hot_regs_in_stack_model();
 
         // Overflow: return MIN_INT
         self.bytecode.jumpdest(&format!("{}_overflow", div_label));
-        self.stack.clear();
+        self.restore_hot_regs_in_stack_model();
         self.t_push4(0x80000000);
 
         self.bytecode.jumpdest(&end_label);
-        self.stack.clear();
+        self.restore_hot_regs_in_stack_model();
         self.stack.push_unknown(); // Result is on stack
     }
 
@@ -1543,15 +2160,15 @@ impl Compiler {
         self.emit_load_reg(rs1);
         self.t_binary_op(Opcode::Div);
         self.bytecode.jump_to(&end_label);
-        self.stack.clear();
+        self.restore_hot_regs_in_stack_model();
 
         // Division by zero: return MAX_UINT
         self.bytecode.jumpdest(&format!("{}_zero", div_label));
-        self.stack.clear();
+        self.restore_hot_regs_in_stack_model();
         self.t_push4(0xFFFFFFFF);
 
         self.bytecode.jumpdest(&end_label);
-        self.stack.clear();
+        self.restore_hot_regs_in_stack_model();
         self.stack.push_unknown(); // Result is on stack
     }
 
@@ -1579,15 +2196,15 @@ impl Compiler {
         self.t_binary_op(Opcode::SMod);
         self.emit_mask_to_32bit();
         self.bytecode.jump_to(&end_label);
-        self.stack.clear();
+        self.restore_hot_regs_in_stack_model();
 
         // Division by zero: return rs1
         self.bytecode.jumpdest(&format!("{}_zero", rem_label));
-        self.stack.clear();
+        self.restore_hot_regs_in_stack_model();
         self.emit_load_reg(rs1);
 
         self.bytecode.jumpdest(&end_label);
-        self.stack.clear();
+        self.restore_hot_regs_in_stack_model();
         self.stack.push_unknown(); // Result is on stack
     }
 
@@ -1612,15 +2229,15 @@ impl Compiler {
         self.emit_load_reg(rs1);
         self.t_binary_op(Opcode::Mod);
         self.bytecode.jump_to(&end_label);
-        self.stack.clear();
+        self.restore_hot_regs_in_stack_model();
 
         // Division by zero: return rs1
         self.bytecode.jumpdest(&format!("{}_zero", rem_label));
-        self.stack.clear();
+        self.restore_hot_regs_in_stack_model();
         self.emit_load_reg(rs1);
 
         self.bytecode.jumpdest(&end_label);
-        self.stack.clear();
+        self.restore_hot_regs_in_stack_model();
         self.stack.push_unknown(); // Result is on stack
     }
 
@@ -1670,16 +2287,42 @@ impl Compiler {
             self.cached_count = 0;
         }
 
+        // Check if this is a while-loop exit branch
+        // If so, we need to redirect to the exit block (which will be emitted later)
+        let is_while_loop_exit = if let Some(ref active) = self.active_loop {
+            active.is_while_loop && active.exit_target_pc == Some(target_pc)
+        } else {
+            false
+        };
+
+        #[cfg(test)]
+        if is_while_loop_exit {
+            println!("DEBUG: while-loop exit branch detected, target_pc={:#x}", target_pc);
+        }
+
         // JUMPI: s[0] = destination, s[1] = condition
         // Push target addr, then we have [condition, target] with target on top
         self.bytecode.emit(Opcode::Push2);
         self.stack.push_unknown();
-        self.pending_jumps.push((self.bytecode.position(), target_pc));
+
+        if is_while_loop_exit {
+            // For while-loop exit, record in while_loop_exit_jumps
+            // The actual target will be the exit block (emitted later)
+            #[cfg(test)]
+            println!("DEBUG: adding to while_loop_exit_jumps, placeholder at {}", self.bytecode.position());
+            self.while_loop_exit_jumps.push((self.bytecode.position(), target_pc));
+        } else {
+            // Normal branch - record in pending_jumps
+            self.pending_jumps.push((self.bytecode.position(), target_pc));
+        }
+
         self.bytecode.emit_bytes(&[0, 0]); // Placeholder
         // Stack is now [condition, target_addr] - correct for JUMPI
         self.bytecode.emit(Opcode::JumpI);
         self.stack.pop_n(2); // JUMPI consumes condition and destination
-        // Stack is now empty for fallthrough path
+        #[cfg(test)]
+        println!("DEBUG after branch_with_cleanup: stack len={}", self.stack.entries.len());
+        // Note: Stack model now has hot registers remaining (if in loop)
     }
 
     /// Emit dynamic jump based on computed address (for JALR)
@@ -1753,5 +2396,259 @@ impl Compiler {
 impl Default for Compiler {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod loop_optimization_tests {
+    use super::*;
+    use crate::runtime::Runtime;
+
+    fn encode_r_type(opcode: u32, rd: u32, funct3: u32, rs1: u32, rs2: u32, funct7: u32) -> u32 {
+        opcode | (rd << 7) | (funct3 << 12) | (rs1 << 15) | (rs2 << 20) | (funct7 << 25)
+    }
+
+    fn encode_i_type(opcode: u32, rd: u32, funct3: u32, rs1: u32, imm: i32) -> u32 {
+        opcode | (rd << 7) | (funct3 << 12) | (rs1 << 15) | (((imm as u32) & 0xFFF) << 20)
+    }
+
+    fn encode_b_type(opcode: u32, funct3: u32, rs1: u32, rs2: u32, imm: i32) -> u32 {
+        let imm = imm as u32;
+        let imm12 = (imm >> 12) & 1;
+        let imm10_5 = (imm >> 5) & 0x3F;
+        let imm4_1 = (imm >> 1) & 0xF;
+        let imm11 = (imm >> 11) & 1;
+        opcode | (imm11 << 7) | (imm4_1 << 8) | (funct3 << 12) | (rs1 << 15) | (rs2 << 20) | (imm10_5 << 25) | (imm12 << 31)
+    }
+
+    fn addi(rd: u32, rs1: u32, imm: i32) -> u32 { encode_i_type(0b0010011, rd, 0b000, rs1, imm) }
+    fn add(rd: u32, rs1: u32, rs2: u32) -> u32 { encode_r_type(0b0110011, rd, 0b000, rs1, rs2, 0b0000000) }
+    fn bne(rs1: u32, rs2: u32, imm: i32) -> u32 { encode_b_type(0b1100011, 0b001, rs1, rs2, imm) }
+    fn ecall() -> u32 { 0x00000073 }
+
+    const ZERO: u32 = 0;
+    const A0: u32 = 10;
+    const T0: u32 = 5;
+
+    /// Test: sum 1 to n using a do-while loop with conditional back edge
+    /// This pattern CAN be optimized because the back edge is BNE
+    ///
+    /// loop:
+    ///   sum += n
+    ///   n--
+    ///   bne n, zero, loop  ; conditional back edge
+    #[test]
+    fn test_dowhile_loop_with_conditional_back_edge() {
+        // Sum 1 to 10 = 55
+        let instructions = [
+            addi(A0, ZERO, 10),         // 0: a0 = n = 10
+            addi(T0, ZERO, 0),          // 4: t0 = sum = 0
+            // loop header at PC 8:
+            add(T0, T0, A0),            // 8: sum += n
+            addi(A0, A0, -1),           // 12: n--
+            bne(A0, ZERO, -8),          // 16: if n != 0, goto loop (PC 8)
+            add(A0, T0, ZERO),          // 20: a0 = sum
+            ecall(),                    // 24: return
+        ];
+
+        let program: Vec<u8> = instructions.iter()
+            .flat_map(|i| i.to_le_bytes())
+            .collect();
+
+        let config = CompilerConfig {
+            load_address: 0x80000000,
+            stack_pointer: 0x80010000,
+            memory_size: 0x20000,
+            ..Default::default()
+        };
+
+        let mut compiler = Compiler::with_config(config);
+        let bytecode = compiler.compile(&program).expect("Compilation failed");
+
+        // Debug output
+        println!("Detected loops: {}", compiler.detected_loops.len());
+        for (i, loop_info) in compiler.detected_loops.iter().enumerate() {
+            println!("Loop {}: header={:#x}, back_edge={:#x}, hot_regs={:?}",
+                i, loop_info.header_pc, loop_info.back_edge_pc, loop_info.hot_regs);
+        }
+        println!("Bytecode size: {} bytes", bytecode.len());
+
+        // Compile without optimization for comparison
+        let config_no_opt = CompilerConfig {
+            load_address: 0x80000000,
+            stack_pointer: 0x80010000,
+            memory_size: 0x20000,
+            ..Default::default()
+        };
+        let program2: Vec<u8> = [
+            addi(A0, ZERO, 10),
+            addi(T0, ZERO, 0),
+            add(T0, T0, A0),            // Use unconditional back edge
+            addi(A0, A0, -1),
+            // Can't easily disable opt, just compare sizes
+        ].iter().flat_map(|i| i.to_le_bytes()).collect();
+        let mut compiler2 = Compiler::with_config(config_no_opt);
+        let _ = compiler2.compile(&program2);
+        println!("Non-loop bytecode size: {} bytes (partial)", compiler2.bytecode.bytecode().len());
+
+        // Run and verify correctness
+        let runtime = Runtime::new(bytecode);
+        let output = runtime.execute().expect("Execution failed");
+        println!("Result: {}, Gas: {}", output.return_value, output.gas_used);
+
+        // Check that a loop was detected
+        assert!(!compiler.detected_loops.is_empty(), "Should detect the do-while loop");
+        assert_eq!(output.return_value, 55, "Sum 1 to 10 should be 55");
+    }
+
+    /// Compare gas usage: do-while (conditional back edge) vs while (unconditional back edge)
+    #[test]
+    fn test_compare_loop_styles() {
+        // Style 1: Do-while with conditional back edge (can be optimized)
+        // Use n=10 to match the failing test
+        let dowhile_instructions = [
+            addi(A0, ZERO, 10),         // 0: a0 = n = 10
+            addi(T0, ZERO, 0),          // 4: t0 = sum = 0
+            // loop:
+            add(T0, T0, A0),            // 8: sum += n
+            addi(A0, A0, -1),           // 12: n--
+            bne(A0, ZERO, -8),          // 16: if n != 0, goto loop
+            add(A0, T0, ZERO),          // 20: return sum
+            ecall(),                    // 24
+        ];
+
+        // Style 2: While with unconditional back edge (cannot be optimized)
+        fn jal(rd: u32, imm: i32) -> u32 {
+            let imm = imm as u32;
+            let imm20 = (imm >> 20) & 1;
+            let imm10_1 = (imm >> 1) & 0x3FF;
+            let imm11 = (imm >> 11) & 1;
+            let imm19_12 = (imm >> 12) & 0xFF;
+            0b1101111 | (rd << 7) | (imm19_12 << 12) | (imm11 << 20) | (imm10_1 << 21) | (imm20 << 31)
+        }
+        fn beq(rs1: u32, rs2: u32, imm: i32) -> u32 { encode_b_type(0b1100011, 0b000, rs1, rs2, imm) }
+
+        let while_instructions = [
+            addi(A0, ZERO, 10),         // 0: a0 = n = 10
+            addi(T0, ZERO, 0),          // 4: t0 = sum = 0
+            // loop:
+            beq(A0, ZERO, 16),          // 8: if n == 0, goto done
+            add(T0, T0, A0),            // 12: sum += n
+            addi(A0, A0, -1),           // 16: n--
+            jal(ZERO, -12),             // 20: goto loop (unconditional)
+            // done:
+            add(A0, T0, ZERO),          // 24: return sum
+            ecall(),                    // 28
+        ];
+
+        let config = CompilerConfig {
+            load_address: 0x80000000,
+            stack_pointer: 0x80010000,
+            memory_size: 0x20000,
+            ..Default::default()
+        };
+
+        // Compile and run do-while style
+        let dowhile_program: Vec<u8> = dowhile_instructions.iter()
+            .flat_map(|i| i.to_le_bytes())
+            .collect();
+        let mut compiler1 = Compiler::with_config(config.clone());
+        let bytecode1 = compiler1.compile(&dowhile_program).expect("Compilation failed");
+        let loops_detected = compiler1.detected_loops.len();
+        let runtime1 = Runtime::new(bytecode1);
+        let output1 = runtime1.execute().expect("Execution failed");
+
+        // Compile and run while style
+        let while_program: Vec<u8> = while_instructions.iter()
+            .flat_map(|i| i.to_le_bytes())
+            .collect();
+        let mut compiler2 = Compiler::with_config(config);
+        let bytecode2 = compiler2.compile(&while_program).expect("Compilation failed");
+        let runtime2 = Runtime::new(bytecode2);
+        let output2 = runtime2.execute().expect("Execution failed");
+
+        // Both should produce correct result
+        assert_eq!(output1.return_value, 55, "Do-while sum 1-10 should be 55");
+        assert_eq!(output2.return_value, 55, "While sum 1-10 should be 55");
+
+        println!("Loop optimization test (sum 1-10):");
+        println!("  Do-while (conditional back edge): {} gas, {} loops detected", output1.gas_used, loops_detected);
+        println!("  While (unconditional back edge):  {} gas", output2.gas_used);
+
+        if loops_detected > 0 && output1.gas_used < output2.gas_used {
+            println!("  Savings: {} gas ({:.1}%)",
+                output2.gas_used - output1.gas_used,
+                (1.0 - output1.gas_used as f64 / output2.gas_used as f64) * 100.0);
+        }
+    }
+
+    /// Test: while-loop with 3 hot registers (like GCD)
+    #[test]
+    fn test_while_loop_3_hot_regs() {
+        fn jal(rd: u32, imm: i32) -> u32 {
+            let imm = imm as u32;
+            let imm20 = (imm >> 20) & 1;
+            let imm10_1 = (imm >> 1) & 0x3FF;
+            let imm11 = (imm >> 11) & 1;
+            let imm19_12 = (imm >> 12) & 0xFF;
+            0b1101111 | (rd << 7) | (imm19_12 << 12) | (imm11 << 20) | (imm10_1 << 21) | (imm20 << 31)
+        }
+        fn beq(rs1: u32, rs2: u32, imm: i32) -> u32 { encode_b_type(0b1100011, 0b000, rs1, rs2, imm) }
+        fn remu(rd: u32, rs1: u32, rs2: u32) -> u32 {
+            0b0110011 | (rd << 7) | (0b111 << 12) | (rs1 << 15) | (rs2 << 20) | (0b0000001 << 25)
+        }
+        fn mv(rd: u32, rs1: u32) -> u32 { add(rd, rs1, ZERO) }
+        const T1: u32 = 6;
+        const T2: u32 = 7;
+
+        // GCD-like structure: 3 hot registers (T0=5, T1=6, T2=7)
+        let instructions = [
+            addi(T0, ZERO, 48),         // 0x00: t0 = 48
+            addi(T1, ZERO, 18),         // 0x04: t1 = 18
+            // loop:
+            beq(T1, ZERO, 20),          // 0x08: if t1 == 0, goto done (0x1c)
+            remu(T2, T0, T1),           // 0x0c: t2 = t0 % t1
+            mv(T0, T1),                 // 0x10: t0 = t1
+            mv(T1, T2),                 // 0x14: t1 = t2
+            jal(ZERO, -16),             // 0x18: goto loop (0x08)
+            // done:
+            mv(A0, T0),                 // 0x1c: a0 = t0
+            ecall(),                    // 0x20: return
+        ];
+
+        let program: Vec<u8> = instructions.iter()
+            .flat_map(|i| i.to_le_bytes())
+            .collect();
+
+        let config = CompilerConfig {
+            load_address: 0x80000000,
+            stack_pointer: 0x80010000,
+            memory_size: 0x20000,
+            ..Default::default()
+        };
+
+        let mut compiler = Compiler::with_config(config);
+        let bytecode = compiler.compile(&program).expect("Compilation failed");
+
+        // Print detected loops
+        println!("Detected loops: {}", compiler.detected_loops.len());
+        for (i, loop_info) in compiler.detected_loops.iter().enumerate() {
+            println!("Loop {}: header={:#x}, back_edge={:#x}, is_while={}, hot_regs={:?}, exit_pc={:?}, exit_target={:?}",
+                i, loop_info.header_pc, loop_info.back_edge_pc, loop_info.is_while_loop,
+                loop_info.hot_regs, loop_info.exit_branch_pc, loop_info.exit_target_pc);
+        }
+        println!("Bytecode size: {} bytes", bytecode.len());
+
+        // Check loop was detected
+        assert_eq!(compiler.detected_loops.len(), 1, "Should detect one while-loop");
+        let loop_info = &compiler.detected_loops[0];
+        assert!(loop_info.is_while_loop, "Should be detected as while-loop");
+        assert_eq!(loop_info.hot_regs.len(), 3, "Should have 3 hot registers");
+
+        // Now execute
+        let runtime = Runtime::new(bytecode);
+        let output = runtime.execute().expect("Execution failed");
+        println!("Result: {}, Gas: {}", output.return_value, output.gas_used);
+        assert_eq!(output.return_value, 6, "GCD(48, 18) should be 6");
     }
 }
