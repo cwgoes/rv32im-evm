@@ -31,6 +31,10 @@ tempfile = "3"
 name = "rv32im-evm"
 path = "src/main.rs"
 
+[[bin]]
+name = "factorial-benchmark"
+path = "benches/factorial_benchmark.rs"
+
 [lib]
 name = "rv32im_evm"
 path = "src/lib.rs"
