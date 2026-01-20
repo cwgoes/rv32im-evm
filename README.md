@@ -12,6 +12,7 @@ This project compiles RISC-V rv32im (base integer + multiply/divide extension) b
 - Direct binary-to-bytecode compilation (no intermediate representation)
 - EVM Cancun spec support (uses PUSH0 for efficiency)
 - Comprehensive test suite (87 tests covering the rv32im spec)
+- **Optimized JUMPDEST emission** - only emits at actual jump targets (~2-3% gas savings)
 
 ## Usage
 
@@ -44,12 +45,12 @@ The benchmark compiles various mathematical functions from RISC-V assembly to EV
 
 | Function | Input | Result | Total Gas | Exec Gas |
 |----------|-------|--------|-----------|----------|
-| Factorial | 10! | 3,628,800 | 22,569 | 1,375 |
-| Fibonacci | fib(20) | 6,765 | 25,275 | 4,081 |
-| GCD | gcd(10000, 7777) | 1 | 23,026 | 1,832 |
-| Sum | 1+...+1000 | 500,500 | 147,288 | 126,094 |
-| Power | 2^10 | 1,024 | 22,596 | 1,402 |
-| Is Prime | 997 | prime | 28,928 | 7,734 |
+| Factorial | 10! | 3,628,800 | 22,537 | 1,344 |
+| Fibonacci | fib(20) | 6,765 | 25,172 | 3,979 |
+| GCD | gcd(10000, 7777) | 1 | 22,989 | 1,796 |
+| Sum | 1+...+1000 | 500,500 | 144,286 | 123,093 |
+| Power | 2^10 | 1,024 | 22,563 | 1,370 |
+| Is Prime | 997 | prime | 28,774 | 7,581 |
 
 *Exec Gas = Total Gas minus ~21k base overhead*
 
@@ -57,11 +58,11 @@ The benchmark compiles various mathematical functions from RISC-V assembly to EV
 
 | Loop Type | Gas/Iteration | Instructions/Iter | Gas/Instruction |
 |-----------|---------------|-------------------|-----------------|
-| Factorial (mul) | ~128 | 4 | ~32 |
-| Fibonacci (add) | ~198 | 6 | ~33 |
-| Sum (add) | ~126 | 4 | ~31 |
+| Factorial (mul) | ~125 | 4 | ~31 |
+| Fibonacci (add) | ~193 | 6 | ~32 |
+| Sum (add) | ~123 | 4 | ~31 |
 
-**Mean overhead: ~32 EVM gas per rv32im instruction**
+**Mean overhead: ~31 EVM gas per rv32im instruction**
 
 This overhead factor includes:
 - Register load/store operations (EVM memory access)

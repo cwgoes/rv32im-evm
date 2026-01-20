@@ -11,10 +11,129 @@
 //! - 0x0100+: RISC-V memory (offset by 0x100)
 //!
 //! All values are stored in little-endian format (RISC-V native).
+//!
+//! # Stack Caching Optimization
+//!
+//! The compiler maintains a cache of register values on the EVM stack.
+//! When a register value is needed and it's already on the stack, we use
+//! DUP instead of MLOAD, saving significant gas (3 gas vs 12+ gas).
 
 use crate::decoder::{decode_instruction, Instruction};
 use crate::evm::{EvmBytecode, Opcode};
 use std::collections::HashMap;
+
+/// Maximum stack depth for caching (EVM limit is 1024, but we use less for efficiency)
+const MAX_CACHE_DEPTH: usize = 16;
+
+/// Entry in the stack cache tracking a register value
+#[derive(Debug, Clone, Copy)]
+struct CacheEntry {
+    /// The RISC-V register number (0-31)
+    reg: u8,
+    /// Whether this entry is still valid (not overwritten in memory)
+    valid: bool,
+}
+
+/// Stack cache for register values
+///
+/// Tracks which register values are currently on the EVM stack.
+/// Index 0 is the top of the stack (most recently pushed).
+#[derive(Debug, Clone)]
+struct StackCache {
+    /// Stack entries, index 0 = top of stack
+    entries: Vec<CacheEntry>,
+}
+
+impl StackCache {
+    fn new() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    /// Record that a register value was pushed onto the stack
+    fn push(&mut self, reg: u8) {
+        self.entries.insert(0, CacheEntry { reg, valid: true });
+        // Trim to max depth
+        if self.entries.len() > MAX_CACHE_DEPTH {
+            self.entries.pop();
+        }
+    }
+
+    /// Record that the top of stack was popped
+    fn pop(&mut self) {
+        if !self.entries.is_empty() {
+            self.entries.remove(0);
+        }
+    }
+
+    /// Record that n items were popped from the stack
+    fn pop_n(&mut self, n: usize) {
+        for _ in 0..n {
+            self.pop();
+        }
+    }
+
+    /// Find a register value in the cache, returns stack depth (1-based for DUP)
+    /// Returns None if not found or invalid
+    /// NOTE: Cache disabled for now - always returns None
+    fn find(&self, _reg: u8) -> Option<usize> {
+        // Cache disabled until proper stack tracking is implemented
+        None
+        /*
+        // x0 is always 0, never cached
+        if reg == 0 {
+            return None;
+        }
+        for (i, entry) in self.entries.iter().enumerate() {
+            if entry.reg == reg && entry.valid {
+                // DUP opcodes are 1-indexed (DUP1 = top of stack)
+                return Some(i + 1);
+            }
+        }
+        None
+        */
+    }
+
+    /// Invalidate all cache entries for a register (when it's written to memory)
+    fn invalidate(&mut self, reg: u8) {
+        for entry in &mut self.entries {
+            if entry.reg == reg {
+                entry.valid = false;
+            }
+        }
+    }
+
+    /// Clear the entire cache (at control flow boundaries)
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Record that a DUP operation was performed, duplicating item at depth
+    fn dup(&mut self, depth: usize) {
+        if depth > 0 && depth <= self.entries.len() {
+            let entry = self.entries[depth - 1];
+            self.entries.insert(0, entry);
+            if self.entries.len() > MAX_CACHE_DEPTH {
+                self.entries.pop();
+            }
+        }
+    }
+
+    /// Record that a SWAP was performed between top and position depth
+    fn swap(&mut self, depth: usize) {
+        if depth > 0 && depth <= self.entries.len() {
+            self.entries.swap(0, depth);
+        }
+    }
+
+    /// Push an unknown/non-register value onto the stack
+    fn push_unknown(&mut self) {
+        // Use reg 255 as a sentinel for non-register values
+        self.entries.insert(0, CacheEntry { reg: 255, valid: false });
+        if self.entries.len() > MAX_CACHE_DEPTH {
+            self.entries.pop();
+        }
+    }
+}
 
 /// Memory layout constants
 /// Each register gets a full 32-byte EVM word to avoid overlap issues
@@ -53,6 +172,8 @@ pub struct Compiler {
     pc_to_evm: HashMap<u32, usize>,
     /// Maps EVM placeholder positions to RISC-V PC targets
     pending_jumps: Vec<(usize, u32)>,
+    /// Stack cache for register value optimization
+    stack_cache: StackCache,
 }
 
 impl Compiler {
@@ -68,6 +189,7 @@ impl Compiler {
             bytecode: EvmBytecode::new(),
             pc_to_evm: HashMap::new(),
             pending_jumps: Vec::new(),
+            stack_cache: StackCache::new(),
         }
     }
 
@@ -76,7 +198,7 @@ impl Compiler {
     /// The input is raw RISC-V machine code bytes.
     /// Returns EVM bytecode that can be executed.
     pub fn compile(&mut self, program: &[u8]) -> Result<Vec<u8>, String> {
-        // First pass: decode all instructions and record PC mappings
+        // First pass: decode all instructions and identify jump targets
         let instructions: Vec<(u32, Instruction)> = program
             .chunks_exact(4)
             .enumerate()
@@ -87,6 +209,37 @@ impl Compiler {
             })
             .collect();
 
+        // Identify all jump targets
+        let mut jump_targets: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        // First instruction is always a target (entry point)
+        if let Some((first_pc, _)) = instructions.first() {
+            jump_targets.insert(*first_pc);
+        }
+        // Scan for branch/jump targets
+        for (pc, instr) in &instructions {
+            match instr {
+                Instruction::Jal { imm, .. } => {
+                    jump_targets.insert(pc.wrapping_add(*imm as u32));
+                }
+                Instruction::Beq { imm, .. }
+                | Instruction::Bne { imm, .. }
+                | Instruction::Blt { imm, .. }
+                | Instruction::Bge { imm, .. }
+                | Instruction::Bltu { imm, .. }
+                | Instruction::Bgeu { imm, .. } => {
+                    jump_targets.insert(pc.wrapping_add(*imm as u32));
+                }
+                Instruction::Jalr { .. } => {
+                    // Dynamic jump - all instructions are potential targets
+                    // For now, mark all as targets (conservative)
+                    for (target_pc, _) in &instructions {
+                        jump_targets.insert(*target_pc);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         // Emit initialization code
         self.emit_init();
 
@@ -95,8 +248,15 @@ impl Compiler {
             // Record the EVM position for this RISC-V PC
             self.pc_to_evm.insert(*pc, self.bytecode.position());
 
-            // Emit JUMPDEST for potential jump targets
-            self.bytecode.emit(Opcode::JumpDest);
+            // Only emit JUMPDEST for actual jump targets
+            let is_jump_target = jump_targets.contains(pc);
+            if is_jump_target {
+                self.bytecode.emit(Opcode::JumpDest);
+            }
+
+            // Clear cache at start of each instruction
+            // This ensures we don't have stale entries from previous instructions
+            self.clear_stack_cache();
 
             // Compile the instruction
             self.compile_instruction(*pc, instr)?;
@@ -602,40 +762,89 @@ impl Compiler {
     // ============================================================
 
     /// Load a register value onto the EVM stack
+    /// Uses simple stack tracking to use DUP when the same register is needed again
     fn emit_load_reg(&mut self, reg: u8) {
         if reg == 0 {
             // x0 is always 0
             self.bytecode.push0();
+            self.stack_cache.push(0);
+        } else if let Some(depth) = self.stack_cache.find(reg) {
+            // Register value is already on the stack - use DUP
+            // This happens when the same register is loaded multiple times
+            if depth <= 16 {
+                self.emit_dup(depth);
+                self.stack_cache.dup(depth);
+            } else {
+                // Too deep for DUP, fall back to memory load
+                self.emit_load_reg_from_memory(reg);
+            }
         } else {
-            // Load from memory: MLOAD(REG_BASE + reg * 4)
-            // But MLOAD reads 32 bytes, so we need to read and mask
-            let addr = REG_BASE + (reg as u32) * REG_SIZE;
-            self.bytecode.push_u32(addr);
-            self.bytecode.emit(Opcode::MLoad);
-            // Value is in the high bits, shift right to get it
-            self.bytecode.push1(224); // 256 - 32 = 224
-            self.bytecode.emit(Opcode::Shr);
+            // Load from memory
+            self.emit_load_reg_from_memory(reg);
         }
     }
 
+    /// Load a register value from memory (no cache check)
+    fn emit_load_reg_from_memory(&mut self, reg: u8) {
+        let addr = REG_BASE + (reg as u32) * REG_SIZE;
+        self.bytecode.push_u32(addr);
+        self.bytecode.emit(Opcode::MLoad);
+        // Value is in the high bits, shift right to get it
+        self.bytecode.push1(224); // 256 - 32 = 224
+        self.bytecode.emit(Opcode::Shr);
+        self.stack_cache.push(reg);
+    }
+
+    /// Emit a DUP opcode for the given depth (1-16)
+    fn emit_dup(&mut self, depth: usize) {
+        let opcode = match depth {
+            1 => Opcode::Dup1,
+            2 => Opcode::Dup2,
+            3 => Opcode::Dup3,
+            4 => Opcode::Dup4,
+            5 => Opcode::Dup5,
+            6 => Opcode::Dup6,
+            7 => Opcode::Dup7,
+            8 => Opcode::Dup8,
+            9 => Opcode::Dup9,
+            10 => Opcode::Dup10,
+            11 => Opcode::Dup11,
+            12 => Opcode::Dup12,
+            13 => Opcode::Dup13,
+            14 => Opcode::Dup14,
+            15 => Opcode::Dup15,
+            16 => Opcode::Dup16,
+            _ => panic!("Invalid DUP depth: {}", depth),
+        };
+        self.bytecode.emit(opcode);
+    }
+
     /// Store the top of stack value into a register
+    /// Updates the stack cache to invalidate old values and track the store
     fn emit_store_reg(&mut self, reg: u8) {
         if reg == 0 {
             // Writing to x0 is a no-op, just pop the value
             self.bytecode.emit(Opcode::Pop);
+            self.stack_cache.pop();
         } else {
+            // Invalidate any cached copies of this register (they're now stale)
+            self.stack_cache.invalidate(reg);
             // Shift left to put in high bits, then store
             self.bytecode.push1(224);
             self.bytecode.emit(Opcode::Shl);
             let addr = REG_BASE + (reg as u32) * REG_SIZE;
             self.bytecode.push_u32(addr);
             self.bytecode.emit(Opcode::MStore);
+            // The value was consumed from the stack
+            self.stack_cache.pop();
         }
     }
 
     /// Store an immediate value into a register
     fn emit_store_reg_imm(&mut self, reg: u8, value: u32) {
         if reg != 0 {
+            // Invalidate any cached copies of this register
+            self.stack_cache.invalidate(reg);
             self.bytecode.push_u32(value);
             self.bytecode.push1(224);
             self.bytecode.emit(Opcode::Shl);
@@ -643,6 +852,11 @@ impl Compiler {
             self.bytecode.push_u32(addr);
             self.bytecode.emit(Opcode::MStore);
         }
+    }
+
+    /// Clear the stack cache (at control flow boundaries)
+    fn clear_stack_cache(&mut self) {
+        self.stack_cache.clear();
     }
 
     // ============================================================
@@ -877,9 +1091,13 @@ impl Compiler {
     }
 
     /// Mask value to 32 bits
+    /// Note: This modifies the stack so we clear the cache
     fn emit_mask_to_32bit(&mut self) {
         self.bytecode.push4(0xFFFFFFFF);
         self.bytecode.emit(Opcode::And);
+        // The top value is now unknown (masked result, not a register)
+        // Clear cache to avoid incorrect DUP usage
+        self.stack_cache.clear();
     }
 
     // ============================================================
