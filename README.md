@@ -16,6 +16,7 @@ This project compiles RISC-V rv32im (base integer + multiply/divide extension) b
 - **Register DUP optimization** - uses DUP1 when same register is loaded twice consecutively
 - **Low-bits register storage** - eliminates SHL/SHR for register access (~30% gas savings)
 - **Selective 32-bit masking** - only masks when overflow is possible
+- **Optimized memory access** - single MLOAD + BYTE extraction for word/halfword loads
 
 ## Usage
 
@@ -106,8 +107,8 @@ The SHA-256 benchmark demonstrates compiling cryptographic code from C to rv32im
 | Metric | Value |
 |--------|-------|
 | RISC-V code size | 1,824 bytes |
-| EVM bytecode size | 26,848 bytes |
-| Expansion ratio | 14.7x |
+| EVM bytecode size | 19,953 bytes |
+| Expansion ratio | 10.9x |
 
 *Full SHA-256 implementation compiled with GCC (`-march=rv32im -O2`)*
 
@@ -115,11 +116,11 @@ The SHA-256 benchmark demonstrates compiling cryptographic code from C to rv32im
 
 | Rounds | Total Gas | Gas/Round |
 |--------|-----------|-----------|
-| 1 | 52,766 | 52,766 |
-| 4 | 56,468 | 14,117 |
-| 16 | 71,276 | 4,455 |
-| 64 | 130,508 | 2,039 |
-| 256 | 367,436 | 1,435 |
+| 1 | 50,381 | 50,381 |
+| 4 | 53,777 | 13,444 |
+| 16 | 67,361 | 4,210 |
+| 64 | 121,697 | 1,902 |
+| 256 | 339,041 | 1,324 |
 
 The hand-assembled benchmark implements SHA-256-like operations:
 - ROTR (rotate right) using SRL + SLL + OR

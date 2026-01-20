@@ -1154,22 +1154,26 @@ impl Compiler {
     }
 
     /// Load a halfword (signed) from little-endian memory
+    /// Optimized: single MLOAD + BYTE extraction instead of 2 separate loads
     fn emit_load_half_signed(&mut self, base_reg: u8, offset: i32) {
-        // Load low byte
+        // Compute EVM address once
         self.emit_compute_evm_addr(base_reg, offset);
         self.t_mload();
-        self.t_push1(248);
-        self.t_binary_op(Opcode::Shr);
-        self.t_push1(0xFF);
-        self.t_binary_op(Opcode::And);
+        // Stack: [mem_value]
 
-        // Load high byte
-        self.emit_compute_evm_addr(base_reg, offset.wrapping_add(1));
-        self.t_mload();
-        self.t_push1(248);
-        self.t_binary_op(Opcode::Shr);
-        self.t_push1(0xFF);
-        self.t_binary_op(Opcode::And);
+        // Extract byte 0 (low byte)
+        self.t_dup(1);
+        self.t_push1(0);
+        self.bytecode.emit(Opcode::Byte);
+        self.stack.binary_op();
+        // Stack: [mem_value, byte0]
+
+        // Extract byte 1 (high byte) - use SWAP to consume mem_value
+        self.t_swap(1);
+        self.t_push1(1);
+        self.bytecode.emit(Opcode::Byte);
+        self.stack.binary_op();
+        // Stack: [byte0, byte1]
 
         // Combine: high_byte << 8 | low_byte
         self.t_push1(8);
@@ -1181,22 +1185,26 @@ impl Compiler {
     }
 
     /// Load a halfword (unsigned) from little-endian memory
+    /// Optimized: single MLOAD + BYTE extraction instead of 2 separate loads
     fn emit_load_half_unsigned(&mut self, base_reg: u8, offset: i32) {
-        // Load low byte
+        // Compute EVM address once
         self.emit_compute_evm_addr(base_reg, offset);
         self.t_mload();
-        self.t_push1(248);
-        self.t_binary_op(Opcode::Shr);
-        self.t_push1(0xFF);
-        self.t_binary_op(Opcode::And);
+        // Stack: [mem_value]
 
-        // Load high byte
-        self.emit_compute_evm_addr(base_reg, offset.wrapping_add(1));
-        self.t_mload();
-        self.t_push1(248);
-        self.t_binary_op(Opcode::Shr);
-        self.t_push1(0xFF);
-        self.t_binary_op(Opcode::And);
+        // Extract byte 0 (low byte)
+        self.t_dup(1);
+        self.t_push1(0);
+        self.bytecode.emit(Opcode::Byte);
+        self.stack.binary_op();
+        // Stack: [mem_value, byte0]
+
+        // Extract byte 1 (high byte) - use SWAP to consume mem_value
+        self.t_swap(1);
+        self.t_push1(1);
+        self.bytecode.emit(Opcode::Byte);
+        self.stack.binary_op();
+        // Stack: [byte0, byte1]
 
         // Combine: high_byte << 8 | low_byte
         self.t_push1(8);
@@ -1205,47 +1213,61 @@ impl Compiler {
     }
 
     /// Load a word from little-endian memory
+    /// Optimized: single MLOAD + BYTE extraction instead of 4 separate loads
     fn emit_load_word(&mut self, base_reg: u8, offset: i32) {
-        // Load byte 0 (LSB)
+        // Compute EVM address once
         self.emit_compute_evm_addr(base_reg, offset);
-        self.t_mload();
-        self.t_push1(248);
-        self.t_binary_op(Opcode::Shr);
-        self.t_push1(0xFF);
-        self.t_binary_op(Opcode::And);
+        // Stack: [evm_addr]
 
-        // Load byte 1
-        self.emit_compute_evm_addr(base_reg, offset.wrapping_add(1));
+        // Load 32 bytes from memory
         self.t_mload();
-        self.t_push1(248);
-        self.t_binary_op(Opcode::Shr);
-        self.t_push1(0xFF);
-        self.t_binary_op(Opcode::And);
+        // Stack: [mem_value] where byte 0 is at bit position 248-255
+
+        // Extract byte 0 (LSB of little-endian word)
+        // BYTE(i, x): s[0]=i, s[1]=x, returns x[i] where i=0 is most significant byte
+        self.t_dup(1);  // Keep mem_value for later
+        // Stack: [mem_value, mem_value]
+        self.t_push1(0);
+        // Stack: [mem_value, mem_value, 0]
+        self.bytecode.emit(Opcode::Byte);
+        self.stack.binary_op();
+        // Stack: [mem_value, byte0]
+
+        // Extract byte 1
+        self.t_dup(2);  // Copy mem_value (now at depth 2)
+        // Stack: [mem_value, byte0, mem_value]
+        self.t_push1(1);
+        // Stack: [mem_value, byte0, mem_value, 1]
+        self.bytecode.emit(Opcode::Byte);
+        self.stack.binary_op();
+        // Stack: [mem_value, byte0, byte1]
         self.t_push1(8);
         self.t_binary_op(Opcode::Shl);
         self.t_binary_op(Opcode::Or);
+        // Stack: [mem_value, byte0 | (byte1 << 8)]
 
-        // Load byte 2
-        self.emit_compute_evm_addr(base_reg, offset.wrapping_add(2));
-        self.t_mload();
-        self.t_push1(248);
-        self.t_binary_op(Opcode::Shr);
-        self.t_push1(0xFF);
-        self.t_binary_op(Opcode::And);
+        // Extract byte 2
+        self.t_dup(2);  // Copy mem_value
+        self.t_push1(2);
+        self.bytecode.emit(Opcode::Byte);
+        self.stack.binary_op();
         self.t_push1(16);
         self.t_binary_op(Opcode::Shl);
         self.t_binary_op(Opcode::Or);
+        // Stack: [mem_value, result_so_far]
 
-        // Load byte 3 (MSB)
-        self.emit_compute_evm_addr(base_reg, offset.wrapping_add(3));
-        self.t_mload();
-        self.t_push1(248);
-        self.t_binary_op(Opcode::Shr);
-        self.t_push1(0xFF);
-        self.t_binary_op(Opcode::And);
+        // Extract byte 3 (MSB) - use SWAP to consume mem_value
+        self.t_swap(1);
+        // Stack: [result_so_far, mem_value]
+        self.t_push1(3);
+        // Stack: [result_so_far, mem_value, 3]
+        self.bytecode.emit(Opcode::Byte);
+        self.stack.binary_op();
+        // Stack: [result_so_far, byte3]
         self.t_push1(24);
         self.t_binary_op(Opcode::Shl);
         self.t_binary_op(Opcode::Or);
+        // Stack: [little-endian word]
     }
 
     /// Store a byte to memory
@@ -1291,19 +1313,60 @@ impl Compiler {
     }
 
     /// Store a word to memory (little-endian)
+    /// Optimized: compute EVM base address once and reuse for all 4 bytes
     fn emit_store_word(&mut self, base_reg: u8, src_reg: u8, offset: i32) {
-        for i in 0..4 {
-            self.emit_load_reg(src_reg);
-            self.t_push1((i * 8) as u8);
-            self.t_binary_op(Opcode::Shr);
-            self.t_push1(0xFF);
-            self.t_binary_op(Opcode::And);
-            self.emit_load_reg(base_reg);
-            self.t_push_u32(offset.wrapping_add(i) as u32);
-            self.t_binary_op(Opcode::Add);
-            self.emit_rv_to_evm_addr();
-            self.t_mstore8();
-        }
+        // Compute EVM base address once
+        self.emit_compute_evm_addr(base_reg, offset);
+        // Stack: [evm_base_addr]
+
+        // Store byte 0 (LSB) - no shift needed
+        self.emit_load_reg(src_reg);
+        self.t_push1(0xFF);
+        self.t_binary_op(Opcode::And);
+        // Stack: [evm_base_addr, byte0]
+        self.t_dup(2);  // Copy evm_base_addr
+        // Stack: [evm_base_addr, byte0, evm_base_addr]
+        self.t_mstore8();
+        // Stack: [evm_base_addr]
+
+        // Store byte 1
+        self.emit_load_reg(src_reg);
+        self.t_push1(8);
+        self.t_binary_op(Opcode::Shr);
+        self.t_push1(0xFF);
+        self.t_binary_op(Opcode::And);
+        self.t_dup(2);
+        self.t_push1(1);
+        self.t_binary_op(Opcode::Add);
+        self.t_mstore8();
+        // Stack: [evm_base_addr]
+
+        // Store byte 2
+        self.emit_load_reg(src_reg);
+        self.t_push1(16);
+        self.t_binary_op(Opcode::Shr);
+        self.t_push1(0xFF);
+        self.t_binary_op(Opcode::And);
+        self.t_dup(2);
+        self.t_push1(2);
+        self.t_binary_op(Opcode::Add);
+        self.t_mstore8();
+        // Stack: [evm_base_addr]
+
+        // Store byte 3 (MSB) - use SWAP to consume evm_base_addr
+        self.emit_load_reg(src_reg);
+        self.t_push1(24);
+        self.t_binary_op(Opcode::Shr);
+        self.t_push1(0xFF);
+        self.t_binary_op(Opcode::And);
+        // Stack: [evm_base_addr, byte3]
+        self.t_swap(1);
+        // Stack: [byte3, evm_base_addr]
+        self.t_push1(3);
+        self.t_binary_op(Opcode::Add);
+        // Stack: [byte3, evm_base_addr+3]
+        self.t_mstore8();
+        // Stack: []
     }
 
     // ============================================================
