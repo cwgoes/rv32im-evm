@@ -67,6 +67,7 @@ fn compile_and_run(instructions: &[u32]) -> (u32, u64) {
         load_address: 0x80000000,
         stack_pointer: 0x80010000,
         memory_size: 0x20000,
+        ..Default::default()
     };
 
     let mut compiler = Compiler::with_config(config);

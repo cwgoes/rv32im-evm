@@ -18,14 +18,21 @@
 //! currently on the EVM stack. When a register value is needed and it's already
 //! on the stack (within DUP1-DUP16 range), we use DUP instead of MLOAD.
 //!
-//! The stack model is cleared at basic block boundaries (JUMPDEST) since we
-//! cannot know the stack state when jumping from other locations.
+//! ## Register Caching (Experimental)
 //!
-//! Note: Due to EVM's stack semantics (operations consume their inputs, MSTORE
-//! consumes the value being stored), register values typically don't persist
-//! across instructions. The optimization primarily helps when:
-//! - The same register is loaded multiple times within an instruction (e.g., `mul rd, rs, rs`)
-//! - A register value happens to still be on the stack from a previous load
+//! The compiler supports optional register caching within basic blocks, controlled
+//! by `CompilerConfig::enable_register_caching`. When enabled, register values
+//! are DUP'd before MSTORE so they remain on the stack for potential reuse.
+//!
+//! **Currently disabled by default** because the cleanup overhead at branch
+//! points (SWAP + POPs) typically exceeds the savings in typical loop patterns.
+//! For a loop with N stores and 1 cache hit before branch:
+//! - Extra costs: N×DUP(3) + SWAP(3) + N×POP(2) = 5N+3 gas
+//! - Savings: ~9 gas per cache hit
+//! - Breakeven: Need 5N+3 < 9×hits, rarely achieved in practice
+//!
+//! The optimization may benefit longer straight-line code sequences with
+//! multiple register reuses, but typical RISC-V loops don't see improvement.
 
 use crate::decoder::{decode_instruction, Instruction};
 use crate::evm::{EvmBytecode, Opcode};
@@ -190,6 +197,11 @@ pub struct CompilerConfig {
     pub stack_pointer: u32,
     /// Memory size in bytes
     pub memory_size: u32,
+    /// Enable basic block register caching
+    /// When true, caches register values on the EVM stack for potential reuse.
+    /// Currently disabled by default as the cleanup overhead at branch points
+    /// exceeds the savings in typical loop patterns.
+    pub enable_register_caching: bool,
 }
 
 impl Default for CompilerConfig {
@@ -198,6 +210,7 @@ impl Default for CompilerConfig {
             load_address: 0x80000000,
             stack_pointer: 0x80010000,
             memory_size: 0x20000, // 128KB
+            enable_register_caching: false, // Disabled: overhead exceeds savings
         }
     }
 }
@@ -212,6 +225,9 @@ pub struct Compiler {
     pending_jumps: Vec<(usize, u32)>,
     /// Stack model for cross-instruction DUP optimization
     stack: StackModel,
+    /// Number of cached register values currently on the EVM stack
+    /// These need to be cleaned up at basic block boundaries
+    cached_count: usize,
 }
 
 impl Compiler {
@@ -228,6 +244,7 @@ impl Compiler {
             pc_to_evm: HashMap::new(),
             pending_jumps: Vec::new(),
             stack: StackModel::new(),
+            cached_count: 0,
         }
     }
 
@@ -283,16 +300,22 @@ impl Compiler {
 
         // Second pass: compile each instruction
         for (pc, instr) in &instructions {
-            // Record the EVM position for this RISC-V PC
-            self.pc_to_evm.insert(*pc, self.bytecode.position());
-
             // Only emit JUMPDEST for actual jump targets
             let is_jump_target = jump_targets.contains(pc);
             if is_jump_target {
+                // Clean up any cached values from previous basic block
+                // (this happens BEFORE the JUMPDEST for the fallthrough path)
+                self.cleanup_cached_values();
+                // Record the EVM position BEFORE emitting JUMPDEST
+                // This ensures jump targets point to the JUMPDEST instruction
+                self.pc_to_evm.insert(*pc, self.bytecode.position());
                 self.bytecode.emit(Opcode::JumpDest);
                 // Clear stack model at basic block boundaries
                 // We can't know stack state when jumping from other locations
                 self.stack.clear();
+            } else {
+                // Not a jump target - record position normally
+                self.pc_to_evm.insert(*pc, self.bytecode.position());
             }
 
             // Compile the instruction
@@ -385,12 +408,13 @@ impl Compiler {
             }
 
             // Branch instructions
+            // Load operands first (may benefit from cache), then cleanup, then branch
             Instruction::Beq { rs1, rs2, imm } => {
                 let target = pc.wrapping_add(*imm as u32);
                 let fallthrough = pc.wrapping_add(4);
                 self.emit_load_reg_pair(*rs1, *rs2);
                 self.t_binary_op(Opcode::Eq);
-                self.emit_conditional_jump_to_rv_pc(target, fallthrough);
+                self.emit_branch_with_cleanup(target, fallthrough);
             }
 
             Instruction::Bne { rs1, rs2, imm } => {
@@ -399,7 +423,7 @@ impl Compiler {
                 self.emit_load_reg_pair(*rs1, *rs2);
                 self.t_binary_op(Opcode::Eq);
                 self.t_unary_op(Opcode::IsZero); // NOT equal
-                self.emit_conditional_jump_to_rv_pc(target, fallthrough);
+                self.emit_branch_with_cleanup(target, fallthrough);
             }
 
             Instruction::Blt { rs1, rs2, imm } => {
@@ -407,7 +431,7 @@ impl Compiler {
                 let fallthrough = pc.wrapping_add(4);
                 // Signed comparison: rs1 < rs2
                 self.emit_signed_lt(*rs1, *rs2);
-                self.emit_conditional_jump_to_rv_pc(target, fallthrough);
+                self.emit_branch_with_cleanup(target, fallthrough);
             }
 
             Instruction::Bge { rs1, rs2, imm } => {
@@ -416,7 +440,7 @@ impl Compiler {
                 // Signed comparison: rs1 >= rs2 (i.e., NOT rs1 < rs2)
                 self.emit_signed_lt(*rs1, *rs2);
                 self.t_unary_op(Opcode::IsZero);
-                self.emit_conditional_jump_to_rv_pc(target, fallthrough);
+                self.emit_branch_with_cleanup(target, fallthrough);
             }
 
             Instruction::Bltu { rs1, rs2, imm } => {
@@ -426,7 +450,7 @@ impl Compiler {
                 self.emit_load_reg_pair(*rs2, *rs1);
                 // LT: returns 1 if s[0] < s[1], i.e., rs1 < rs2
                 self.t_binary_op(Opcode::Lt);
-                self.emit_conditional_jump_to_rv_pc(target, fallthrough);
+                self.emit_branch_with_cleanup(target, fallthrough);
             }
 
             Instruction::Bgeu { rs1, rs2, imm } => {
@@ -437,7 +461,7 @@ impl Compiler {
                 // LT: returns 1 if rs1 < rs2
                 self.t_binary_op(Opcode::Lt);
                 self.t_unary_op(Opcode::IsZero); // NOT less than = >=
-                self.emit_conditional_jump_to_rv_pc(target, fallthrough);
+                self.emit_branch_with_cleanup(target, fallthrough);
             }
 
             // Load instructions
@@ -682,12 +706,14 @@ impl Compiler {
             Instruction::Ecall => {
                 // For testing, ECALL triggers program termination
                 // Return value is in a0 (x10)
+                self.cleanup_cached_values();
                 self.bytecode.jump_to("halt");
                 self.stack.clear();
             }
 
             Instruction::Ebreak => {
                 // For debugging, treat as halt
+                self.cleanup_cached_values();
                 self.bytecode.jump_to("halt");
                 self.stack.clear();
             }
@@ -781,6 +807,20 @@ impl Compiler {
         }
 
         Ok(())
+    }
+
+    // ============================================================
+    // Cache management
+    // ============================================================
+
+    /// Clean up all cached register values from the EVM stack
+    /// Called at basic block boundaries (before JUMPDEST)
+    fn cleanup_cached_values(&mut self) {
+        for _ in 0..self.cached_count {
+            self.bytecode.emit(Opcode::Pop);
+            self.stack.pop();
+        }
+        self.cached_count = 0;
     }
 
     // ============================================================
@@ -956,19 +996,42 @@ impl Compiler {
     }
 
     /// Store the top of stack value into a register
+    ///
+    /// When register caching is enabled, DUPs the value before storing so it
+    /// remains on the stack for potential reuse within the same basic block.
     fn emit_store_reg(&mut self, reg: u8) {
         if reg == 0 {
             // Writing to x0 is a no-op, just pop the value
             self.t_pop();
         } else {
-            // Invalidate any cached copies of this register
+            // Invalidate any old cached copies of this register
             self.stack.invalidate_register(reg);
-            // Shift left to put in high bits, then store
-            self.t_push1(224);
-            self.t_binary_op(Opcode::Shl);
-            let addr = REG_BASE + (reg as u32) * REG_SIZE;
-            self.t_push_u32(addr);
-            self.t_mstore();
+
+            if self.config.enable_register_caching {
+                // Basic block caching: mark the value as this register and DUP it
+                // so a copy remains on the stack for potential reuse
+                self.stack.pop();  // Remove the Unknown entry
+                self.stack.push_register(reg);  // Mark as Register(reg)
+
+                // DUP the value - keeps the original for reuse
+                self.t_dup(1);
+                self.cached_count += 1;
+
+                // Shift the top copy and store it
+                self.t_push1(224);
+                self.t_binary_op(Opcode::Shl);
+                let addr = REG_BASE + (reg as u32) * REG_SIZE;
+                self.t_push_u32(addr);
+                self.t_mstore();
+                // After MSTORE, the original Register(reg) value remains on stack
+            } else {
+                // Standard behavior: just store the value
+                self.t_push1(224);
+                self.t_binary_op(Opcode::Shl);
+                let addr = REG_BASE + (reg as u32) * REG_SIZE;
+                self.t_push_u32(addr);
+                self.t_mstore();
+            }
         }
     }
 
@@ -1267,6 +1330,9 @@ impl Compiler {
 
     /// Signed division
     fn emit_signed_div(&mut self, rs1: u8, rs2: u8) {
+        // Clean up cached values - division has complex internal control flow
+        self.cleanup_cached_values();
+
         let div_label = format!("div_{}", self.bytecode.position());
         let end_label = format!("div_end_{}", self.bytecode.position());
 
@@ -1318,6 +1384,9 @@ impl Compiler {
 
     /// Unsigned division
     fn emit_unsigned_div(&mut self, rs1: u8, rs2: u8) {
+        // Clean up cached values - division has complex internal control flow
+        self.cleanup_cached_values();
+
         let div_label = format!("divu_{}", self.bytecode.position());
         let end_label = format!("divu_end_{}", self.bytecode.position());
 
@@ -1348,6 +1417,9 @@ impl Compiler {
 
     /// Signed remainder
     fn emit_signed_rem(&mut self, rs1: u8, rs2: u8) {
+        // Clean up cached values - remainder has complex internal control flow
+        self.cleanup_cached_values();
+
         let rem_label = format!("rem_{}", self.bytecode.position());
         let end_label = format!("rem_end_{}", self.bytecode.position());
 
@@ -1381,6 +1453,9 @@ impl Compiler {
 
     /// Unsigned remainder
     fn emit_unsigned_rem(&mut self, rs1: u8, rs2: u8) {
+        // Clean up cached values - remainder has complex internal control flow
+        self.cleanup_cached_values();
+
         let rem_label = format!("remu_{}", self.bytecode.position());
         let end_label = format!("remu_end_{}", self.bytecode.position());
 
@@ -1415,6 +1490,8 @@ impl Compiler {
 
     /// Emit a jump to a RISC-V PC address
     fn emit_jump_to_rv_pc(&mut self, target_pc: u32) {
+        // Clean up cached values before jumping to another basic block
+        self.cleanup_cached_values();
         // Record placeholder for later resolution
         self.bytecode.emit(Opcode::Push2);
         self.stack.push_unknown();
@@ -1425,9 +1502,34 @@ impl Compiler {
         self.stack.clear(); // Control flow transfer - stack state unknown at target
     }
 
-    /// Emit a conditional jump to RISC-V PC, with fallthrough
-    fn emit_conditional_jump_to_rv_pc(&mut self, target_pc: u32, _fallthrough_pc: u32) {
-        // Stack has condition on top
+    /// Emit a conditional branch with proper cleanup
+    /// Stack has condition on top, possibly with cached values below
+    fn emit_branch_with_cleanup(&mut self, target_pc: u32, _fallthrough_pc: u32) {
+        // Stack: [...cached..., condition]
+        // Need to cleanup cached values while preserving condition
+
+        if self.cached_count > 0 && self.cached_count <= 16 {
+            // Swap condition below cached values
+            // Stack: [...cached..., condition] -> [condition, ...cached...]
+            self.t_swap(self.cached_count);
+
+            // Pop cached values
+            for _ in 0..self.cached_count {
+                self.bytecode.emit(Opcode::Pop);
+                self.stack.pop();
+            }
+            self.cached_count = 0;
+            // Stack: [condition]
+        } else if self.cached_count > 16 {
+            // Too many cached values, just clear them all
+            // This is rare and not worth optimizing
+            for _ in 0..self.cached_count {
+                self.bytecode.emit(Opcode::Pop);
+                self.stack.pop();
+            }
+            self.cached_count = 0;
+        }
+
         // JUMPI: s[0] = destination, s[1] = condition
         // Push target addr, then we have [condition, target] with target on top
         self.bytecode.emit(Opcode::Push2);
@@ -1437,7 +1539,7 @@ impl Compiler {
         // Stack is now [condition, target_addr] - correct for JUMPI
         self.bytecode.emit(Opcode::JumpI);
         self.stack.pop_n(2); // JUMPI consumes condition and destination
-        // Note: We keep the stack model valid for fallthrough path
+        // Stack is now empty for fallthrough path
     }
 
     /// Emit dynamic jump based on computed address (for JALR)
@@ -1452,6 +1554,9 @@ impl Compiler {
         // Store the target PC temporarily
         self.t_push_u32(PC_ADDR);
         self.t_mstore();
+
+        // Clean up cached values before dynamic jump
+        self.cleanup_cached_values();
 
         // Jump to dispatch routine
         self.bytecode.jump_to("dynamic_dispatch");

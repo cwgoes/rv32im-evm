@@ -15,6 +15,7 @@ fn test_compiler() -> Compiler {
         load_address: 0x80000000,
         stack_pointer: 0x80010000,
         memory_size: 0x20000,
+        ..Default::default()
     };
     Compiler::with_config(config)
 }
