@@ -13,6 +13,7 @@ This project compiles RISC-V rv32im (base integer + multiply/divide extension) b
 - EVM Cancun spec support (uses PUSH0 for efficiency)
 - Comprehensive test suite (87 tests covering the rv32im spec)
 - **Optimized JUMPDEST emission** - only emits at actual jump targets (~2-3% gas savings)
+- **Register DUP optimization** - uses DUP1 when same register is loaded twice consecutively (e.g., `mul rd, rs, rs`)
 
 ## Usage
 
@@ -50,7 +51,7 @@ The benchmark compiles various mathematical functions from RISC-V assembly to EV
 | GCD | gcd(10000, 7777) | 1 | 22,989 | 1,796 |
 | Sum | 1+...+1000 | 500,500 | 144,286 | 123,093 |
 | Power | 2^10 | 1,024 | 22,563 | 1,370 |
-| Is Prime | 997 | prime | 28,774 | 7,581 |
+| Is Prime | 997 | prime | 28,495 | 7,302 |
 
 *Exec Gas = Total Gas minus ~21k base overhead*
 

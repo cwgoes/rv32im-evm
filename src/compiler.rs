@@ -22,115 +22,66 @@ use crate::decoder::{decode_instruction, Instruction};
 use crate::evm::{EvmBytecode, Opcode};
 use std::collections::HashMap;
 
-/// Maximum stack depth for caching (EVM limit is 1024, but we use less for efficiency)
-const MAX_CACHE_DEPTH: usize = 16;
-
-/// Entry in the stack cache tracking a register value
-#[derive(Debug, Clone, Copy)]
-struct CacheEntry {
-    /// The RISC-V register number (0-31)
-    reg: u8,
-    /// Whether this entry is still valid (not overwritten in memory)
-    valid: bool,
-}
-
-/// Stack cache for register values
+/// Simple register cache for consecutive loads
 ///
-/// Tracks which register values are currently on the EVM stack.
-/// Index 0 is the top of the stack (most recently pushed).
+/// Tracks the most recently loaded register to enable DUP1 optimization
+/// when the same register is loaded twice consecutively.
+///
+/// This is a conservative but correct optimization that handles the common
+/// pattern in R-type instructions where rs1 == rs2 (e.g., squaring: mul rd, rs, rs).
 #[derive(Debug, Clone)]
-struct StackCache {
-    /// Stack entries, index 0 = top of stack
-    entries: Vec<CacheEntry>,
+struct RegisterCache {
+    /// The last register that was loaded (None if cache is empty/invalidated)
+    last_reg: Option<u8>,
+    /// Number of consecutive loads of the same register (for deeper DUP)
+    load_count: usize,
 }
 
-impl StackCache {
+impl RegisterCache {
     fn new() -> Self {
-        Self { entries: Vec::new() }
-    }
-
-    /// Record that a register value was pushed onto the stack
-    fn push(&mut self, reg: u8) {
-        self.entries.insert(0, CacheEntry { reg, valid: true });
-        // Trim to max depth
-        if self.entries.len() > MAX_CACHE_DEPTH {
-            self.entries.pop();
+        Self {
+            last_reg: None,
+            load_count: 0,
         }
     }
 
-    /// Record that the top of stack was popped
-    fn pop(&mut self) {
-        if !self.entries.is_empty() {
-            self.entries.remove(0);
-        }
-    }
-
-    /// Record that n items were popped from the stack
-    fn pop_n(&mut self, n: usize) {
-        for _ in 0..n {
-            self.pop();
-        }
-    }
-
-    /// Find a register value in the cache, returns stack depth (1-based for DUP)
-    /// Returns None if not found or invalid
-    /// NOTE: Cache disabled for now - always returns None
-    fn find(&self, _reg: u8) -> Option<usize> {
-        // Cache disabled until proper stack tracking is implemented
-        None
-        /*
-        // x0 is always 0, never cached
+    /// Record that a register was loaded from memory
+    fn record_load(&mut self, reg: u8) {
         if reg == 0 {
-            return None;
-        }
-        for (i, entry) in self.entries.iter().enumerate() {
-            if entry.reg == reg && entry.valid {
-                // DUP opcodes are 1-indexed (DUP1 = top of stack)
-                return Some(i + 1);
-            }
-        }
-        None
-        */
-    }
-
-    /// Invalidate all cache entries for a register (when it's written to memory)
-    fn invalidate(&mut self, reg: u8) {
-        for entry in &mut self.entries {
-            if entry.reg == reg {
-                entry.valid = false;
-            }
+            // x0 is special (always 0), don't track
+            self.last_reg = None;
+            self.load_count = 0;
+        } else {
+            self.last_reg = Some(reg);
+            self.load_count = 1;
         }
     }
 
-    /// Clear the entire cache (at control flow boundaries)
+    /// Record that a DUP was used (same register loaded again)
+    fn record_dup(&mut self) {
+        self.load_count += 1;
+    }
+
+    /// Check if we can use DUP1 for this register (was it just loaded?)
+    /// NOTE: This is disabled - use emit_load_reg_pair for safe DUP optimization
+    fn can_dup(&self, _reg: u8) -> bool {
+        // Disabled: the cache-based approach is error-prone because
+        // operations between emit_load_reg calls don't clear the cache.
+        // Use emit_load_reg_pair() instead for safe consecutive loads.
+        false
+    }
+
+    /// Clear the cache (at instruction boundaries or after stack-modifying ops)
     fn clear(&mut self) {
-        self.entries.clear();
+        self.last_reg = None;
+        self.load_count = 0;
     }
 
-    /// Record that a DUP operation was performed, duplicating item at depth
-    fn dup(&mut self, depth: usize) {
-        if depth > 0 && depth <= self.entries.len() {
-            let entry = self.entries[depth - 1];
-            self.entries.insert(0, entry);
-            if self.entries.len() > MAX_CACHE_DEPTH {
-                self.entries.pop();
-            }
-        }
-    }
-
-    /// Record that a SWAP was performed between top and position depth
-    fn swap(&mut self, depth: usize) {
-        if depth > 0 && depth <= self.entries.len() {
-            self.entries.swap(0, depth);
-        }
-    }
-
-    /// Push an unknown/non-register value onto the stack
-    fn push_unknown(&mut self) {
-        // Use reg 255 as a sentinel for non-register values
-        self.entries.insert(0, CacheEntry { reg: 255, valid: false });
-        if self.entries.len() > MAX_CACHE_DEPTH {
-            self.entries.pop();
+    /// Invalidate a specific register (when it's written to memory)
+    fn invalidate(&mut self, reg: u8) {
+        if self.last_reg == Some(reg) {
+            self.last_reg = None;
+            self.load_count = 0;
         }
     }
 }
@@ -172,8 +123,8 @@ pub struct Compiler {
     pc_to_evm: HashMap<u32, usize>,
     /// Maps EVM placeholder positions to RISC-V PC targets
     pending_jumps: Vec<(usize, u32)>,
-    /// Stack cache for register value optimization
-    stack_cache: StackCache,
+    /// Register cache for DUP optimization
+    reg_cache: RegisterCache,
 }
 
 impl Compiler {
@@ -189,7 +140,7 @@ impl Compiler {
             bytecode: EvmBytecode::new(),
             pc_to_evm: HashMap::new(),
             pending_jumps: Vec::new(),
-            stack_cache: StackCache::new(),
+            reg_cache: RegisterCache::new(),
         }
     }
 
@@ -256,7 +207,7 @@ impl Compiler {
 
             // Clear cache at start of each instruction
             // This ensures we don't have stale entries from previous instructions
-            self.clear_stack_cache();
+            self.clear_reg_cache();
 
             // Compile the instruction
             self.compile_instruction(*pc, instr)?;
@@ -350,8 +301,7 @@ impl Compiler {
             Instruction::Beq { rs1, rs2, imm } => {
                 let target = pc.wrapping_add(*imm as u32);
                 let fallthrough = pc.wrapping_add(4);
-                self.emit_load_reg(*rs1);
-                self.emit_load_reg(*rs2);
+                self.emit_load_reg_pair(*rs1, *rs2);
                 self.bytecode.emit(Opcode::Eq);
                 self.emit_conditional_jump_to_rv_pc(target, fallthrough);
             }
@@ -359,8 +309,7 @@ impl Compiler {
             Instruction::Bne { rs1, rs2, imm } => {
                 let target = pc.wrapping_add(*imm as u32);
                 let fallthrough = pc.wrapping_add(4);
-                self.emit_load_reg(*rs1);
-                self.emit_load_reg(*rs2);
+                self.emit_load_reg_pair(*rs1, *rs2);
                 self.bytecode.emit(Opcode::Eq);
                 self.bytecode.emit(Opcode::IsZero); // NOT equal
                 self.emit_conditional_jump_to_rv_pc(target, fallthrough);
@@ -387,8 +336,7 @@ impl Compiler {
                 let target = pc.wrapping_add(*imm as u32);
                 let fallthrough = pc.wrapping_add(4);
                 // Load rs2 first (bottom), then rs1 (top)
-                self.emit_load_reg(*rs2);
-                self.emit_load_reg(*rs1);
+                self.emit_load_reg_pair(*rs2, *rs1);
                 // LT: returns 1 if s[0] < s[1], i.e., rs1 < rs2
                 self.bytecode.emit(Opcode::Lt);
                 self.emit_conditional_jump_to_rv_pc(target, fallthrough);
@@ -398,8 +346,7 @@ impl Compiler {
                 let target = pc.wrapping_add(*imm as u32);
                 let fallthrough = pc.wrapping_add(4);
                 // Load rs2 first (bottom), then rs1 (top)
-                self.emit_load_reg(*rs2);
-                self.emit_load_reg(*rs1);
+                self.emit_load_reg_pair(*rs2, *rs1);
                 // LT: returns 1 if rs1 < rs2
                 self.bytecode.emit(Opcode::Lt);
                 self.bytecode.emit(Opcode::IsZero); // NOT less than = >=
@@ -547,8 +494,7 @@ impl Compiler {
             // Register arithmetic instructions
             Instruction::Add { rd, rs1, rs2 } => {
                 if *rd != 0 {
-                    self.emit_load_reg(*rs1);
-                    self.emit_load_reg(*rs2);
+                    self.emit_load_reg_pair(*rs1, *rs2);
                     self.bytecode.emit(Opcode::Add);
                     self.emit_mask_to_32bit();
                     self.emit_store_reg(*rd);
@@ -559,8 +505,7 @@ impl Compiler {
                 if *rd != 0 {
                     // Load rs2 first (bottom), then rs1 (top)
                     // EVM SUB: s[0] - s[1] = rs1 - rs2
-                    self.emit_load_reg(*rs2);
-                    self.emit_load_reg(*rs1);
+                    self.emit_load_reg_pair(*rs2, *rs1);
                     self.bytecode.emit(Opcode::Sub);
                     self.emit_mask_to_32bit();
                     self.emit_store_reg(*rd);
@@ -569,8 +514,7 @@ impl Compiler {
 
             Instruction::Sll { rd, rs1, rs2 } => {
                 if *rd != 0 {
-                    self.emit_load_reg(*rs1);
-                    self.emit_load_reg(*rs2);
+                    self.emit_load_reg_pair(*rs1, *rs2);
                     self.bytecode.push1(0x1F);
                     self.bytecode.emit(Opcode::And); // Only low 5 bits of rs2
                     self.bytecode.emit(Opcode::Shl);
@@ -589,8 +533,7 @@ impl Compiler {
             Instruction::Sltu { rd, rs1, rs2 } => {
                 if *rd != 0 {
                     // Load rs2 first (bottom), then rs1 (top)
-                    self.emit_load_reg(*rs2);
-                    self.emit_load_reg(*rs1);
+                    self.emit_load_reg_pair(*rs2, *rs1);
                     // LT: returns 1 if s[0] < s[1], i.e., rs1 < rs2
                     self.bytecode.emit(Opcode::Lt);
                     self.emit_store_reg(*rd);
@@ -599,8 +542,7 @@ impl Compiler {
 
             Instruction::Xor { rd, rs1, rs2 } => {
                 if *rd != 0 {
-                    self.emit_load_reg(*rs1);
-                    self.emit_load_reg(*rs2);
+                    self.emit_load_reg_pair(*rs1, *rs2);
                     self.bytecode.emit(Opcode::Xor);
                     self.emit_store_reg(*rd);
                 }
@@ -608,8 +550,7 @@ impl Compiler {
 
             Instruction::Srl { rd, rs1, rs2 } => {
                 if *rd != 0 {
-                    self.emit_load_reg(*rs1);
-                    self.emit_load_reg(*rs2);
+                    self.emit_load_reg_pair(*rs1, *rs2);
                     self.bytecode.push1(0x1F);
                     self.bytecode.emit(Opcode::And);
                     self.bytecode.emit(Opcode::Shr);
@@ -632,8 +573,7 @@ impl Compiler {
 
             Instruction::Or { rd, rs1, rs2 } => {
                 if *rd != 0 {
-                    self.emit_load_reg(*rs1);
-                    self.emit_load_reg(*rs2);
+                    self.emit_load_reg_pair(*rs1, *rs2);
                     self.bytecode.emit(Opcode::Or);
                     self.emit_store_reg(*rd);
                 }
@@ -641,8 +581,7 @@ impl Compiler {
 
             Instruction::And { rd, rs1, rs2 } => {
                 if *rd != 0 {
-                    self.emit_load_reg(*rs1);
-                    self.emit_load_reg(*rs2);
+                    self.emit_load_reg_pair(*rs1, *rs2);
                     self.bytecode.emit(Opcode::And);
                     self.emit_store_reg(*rd);
                 }
@@ -667,8 +606,7 @@ impl Compiler {
             // M extension (multiply/divide)
             Instruction::Mul { rd, rs1, rs2 } => {
                 if *rd != 0 {
-                    self.emit_load_reg(*rs1);
-                    self.emit_load_reg(*rs2);
+                    self.emit_load_reg_pair(*rs1, *rs2);
                     self.bytecode.emit(Opcode::Mul);
                     self.emit_mask_to_32bit();
                     self.emit_store_reg(*rd);
@@ -708,8 +646,7 @@ impl Compiler {
             Instruction::Mulhu { rd, rs1, rs2 } => {
                 if *rd != 0 {
                     // Unsigned * Unsigned, return high 32 bits
-                    self.emit_load_reg(*rs1);
-                    self.emit_load_reg(*rs2);
+                    self.emit_load_reg_pair(*rs1, *rs2);
                     self.bytecode.emit(Opcode::Mul);
                     self.bytecode.push1(32);
                     self.bytecode.emit(Opcode::Shr);
@@ -762,29 +699,24 @@ impl Compiler {
     // ============================================================
 
     /// Load a register value onto the EVM stack
-    /// Uses simple stack tracking to use DUP when the same register is needed again
+    /// Uses DUP1 when the same register is loaded consecutively
     fn emit_load_reg(&mut self, reg: u8) {
         if reg == 0 {
             // x0 is always 0
             self.bytecode.push0();
-            self.stack_cache.push(0);
-        } else if let Some(depth) = self.stack_cache.find(reg) {
-            // Register value is already on the stack - use DUP
-            // This happens when the same register is loaded multiple times
-            if depth <= 16 {
-                self.emit_dup(depth);
-                self.stack_cache.dup(depth);
-            } else {
-                // Too deep for DUP, fall back to memory load
-                self.emit_load_reg_from_memory(reg);
-            }
+            self.reg_cache.clear(); // x0 loads don't count for caching
+        } else if self.reg_cache.can_dup(reg) {
+            // Same register as last load - use DUP1 instead of MLOAD
+            self.emit_dup(1);
+            self.reg_cache.record_dup();
         } else {
             // Load from memory
             self.emit_load_reg_from_memory(reg);
+            self.reg_cache.record_load(reg);
         }
     }
 
-    /// Load a register value from memory (no cache check)
+    /// Load a register value from memory (always loads, no cache check)
     fn emit_load_reg_from_memory(&mut self, reg: u8) {
         let addr = REG_BASE + (reg as u32) * REG_SIZE;
         self.bytecode.push_u32(addr);
@@ -792,7 +724,18 @@ impl Compiler {
         // Value is in the high bits, shift right to get it
         self.bytecode.push1(224); // 256 - 32 = 224
         self.bytecode.emit(Opcode::Shr);
-        self.stack_cache.push(reg);
+    }
+
+    /// Load two registers onto the stack (rs1 first/bottom, rs2 second/top)
+    /// Uses DUP1 optimization when rs1 == rs2 (e.g., for squaring: mul rd, rs, rs)
+    fn emit_load_reg_pair(&mut self, rs1: u8, rs2: u8) {
+        self.emit_load_reg(rs1);
+        if rs1 == rs2 && rs1 != 0 {
+            // Same non-zero register - use DUP1 instead of another memory load
+            self.emit_dup(1);
+        } else {
+            self.emit_load_reg(rs2);
+        }
     }
 
     /// Emit a DUP opcode for the given depth (1-16)
@@ -820,31 +763,27 @@ impl Compiler {
     }
 
     /// Store the top of stack value into a register
-    /// Updates the stack cache to invalidate old values and track the store
     fn emit_store_reg(&mut self, reg: u8) {
+        // Clear cache - store modifies stack state
+        self.reg_cache.clear();
         if reg == 0 {
             // Writing to x0 is a no-op, just pop the value
             self.bytecode.emit(Opcode::Pop);
-            self.stack_cache.pop();
         } else {
-            // Invalidate any cached copies of this register (they're now stale)
-            self.stack_cache.invalidate(reg);
             // Shift left to put in high bits, then store
             self.bytecode.push1(224);
             self.bytecode.emit(Opcode::Shl);
             let addr = REG_BASE + (reg as u32) * REG_SIZE;
             self.bytecode.push_u32(addr);
             self.bytecode.emit(Opcode::MStore);
-            // The value was consumed from the stack
-            self.stack_cache.pop();
         }
     }
 
     /// Store an immediate value into a register
     fn emit_store_reg_imm(&mut self, reg: u8, value: u32) {
+        // Clear cache - we're modifying a register
+        self.reg_cache.invalidate(reg);
         if reg != 0 {
-            // Invalidate any cached copies of this register
-            self.stack_cache.invalidate(reg);
             self.bytecode.push_u32(value);
             self.bytecode.push1(224);
             self.bytecode.emit(Opcode::Shl);
@@ -854,9 +793,9 @@ impl Compiler {
         }
     }
 
-    /// Clear the stack cache (at control flow boundaries)
-    fn clear_stack_cache(&mut self) {
-        self.stack_cache.clear();
+    /// Clear the register cache (at control flow boundaries)
+    fn clear_reg_cache(&mut self) {
+        self.reg_cache.clear();
     }
 
     // ============================================================
@@ -1006,10 +945,14 @@ impl Compiler {
 
     /// Store a byte to memory
     fn emit_store_byte(&mut self, base_reg: u8, src_reg: u8, offset: i32) {
+        // Clear cache - this function has operations between register loads
+        self.reg_cache.clear();
         // Load source byte
         self.emit_load_reg(src_reg);
         self.bytecode.push1(0xFF);
         self.bytecode.emit(Opcode::And);
+        // Clear cache - stack has masked byte, not src_reg
+        self.reg_cache.clear();
 
         // Compute address
         self.emit_load_reg(base_reg);
@@ -1023,10 +966,13 @@ impl Compiler {
 
     /// Store a halfword to memory (little-endian)
     fn emit_store_half(&mut self, base_reg: u8, src_reg: u8, offset: i32) {
+        // Clear cache - this function has operations between register loads
+        self.reg_cache.clear();
         // Store low byte
         self.emit_load_reg(src_reg);
         self.bytecode.push1(0xFF);
         self.bytecode.emit(Opcode::And);
+        self.reg_cache.clear();
         self.emit_load_reg(base_reg);
         self.bytecode.push_u32(offset as u32);
         self.bytecode.emit(Opcode::Add);
@@ -1039,6 +985,7 @@ impl Compiler {
         self.bytecode.emit(Opcode::Shr);
         self.bytecode.push1(0xFF);
         self.bytecode.emit(Opcode::And);
+        self.reg_cache.clear();
         self.emit_load_reg(base_reg);
         self.bytecode.push_u32(offset.wrapping_add(1) as u32);
         self.bytecode.emit(Opcode::Add);
@@ -1048,12 +995,16 @@ impl Compiler {
 
     /// Store a word to memory (little-endian)
     fn emit_store_word(&mut self, base_reg: u8, src_reg: u8, offset: i32) {
+        // Clear cache - this function has operations between register loads
+        self.reg_cache.clear();
         for i in 0..4 {
             self.emit_load_reg(src_reg);
             self.bytecode.push1((i * 8) as u8);
             self.bytecode.emit(Opcode::Shr);
             self.bytecode.push1(0xFF);
             self.bytecode.emit(Opcode::And);
+            // Clear cache - stack has masked byte, not src_reg
+            self.reg_cache.clear();
             self.emit_load_reg(base_reg);
             self.bytecode.push_u32(offset.wrapping_add(i) as u32);
             self.bytecode.emit(Opcode::Add);
@@ -1088,6 +1039,8 @@ impl Compiler {
         // Stack: [value] -> [value, 3] -> SIGNEXTEND(3, value)
         self.bytecode.push1(3);
         self.bytecode.emit(Opcode::SignExtend);
+        // Clear cache - value is no longer just a register value
+        self.reg_cache.clear();
     }
 
     /// Mask value to 32 bits
@@ -1097,7 +1050,7 @@ impl Compiler {
         self.bytecode.emit(Opcode::And);
         // The top value is now unknown (masked result, not a register)
         // Clear cache to avoid incorrect DUP usage
-        self.stack_cache.clear();
+        self.reg_cache.clear();
     }
 
     // ============================================================
@@ -1106,6 +1059,8 @@ impl Compiler {
 
     /// Signed less-than comparison: rs1 < rs2
     fn emit_signed_lt(&mut self, rs1: u8, rs2: u8) {
+        // Clear cache - this function has sign-extends between loads
+        self.reg_cache.clear();
         // Load rs2 first (will be at bottom of stack)
         self.emit_load_reg(rs2);
         self.emit_sign_extend_32_to_256();
@@ -1144,6 +1099,8 @@ impl Compiler {
 
     /// Signed division
     fn emit_signed_div(&mut self, rs1: u8, rs2: u8) {
+        // Clear cache - this function has operations between register loads
+        self.reg_cache.clear();
         let div_label = format!("div_{}", self.bytecode.position());
         let end_label = format!("div_end_{}", self.bytecode.position());
 
@@ -1187,6 +1144,8 @@ impl Compiler {
 
     /// Unsigned division
     fn emit_unsigned_div(&mut self, rs1: u8, rs2: u8) {
+        // Clear cache - this function has operations between register loads
+        self.reg_cache.clear();
         let div_label = format!("divu_{}", self.bytecode.position());
         let end_label = format!("divu_end_{}", self.bytecode.position());
 
@@ -1212,6 +1171,8 @@ impl Compiler {
 
     /// Signed remainder
     fn emit_signed_rem(&mut self, rs1: u8, rs2: u8) {
+        // Clear cache - this function has operations between register loads
+        self.reg_cache.clear();
         let rem_label = format!("rem_{}", self.bytecode.position());
         let end_label = format!("rem_end_{}", self.bytecode.position());
 
@@ -1240,6 +1201,8 @@ impl Compiler {
 
     /// Unsigned remainder
     fn emit_unsigned_rem(&mut self, rs1: u8, rs2: u8) {
+        // Clear cache - this function has operations between register loads
+        self.reg_cache.clear();
         let rem_label = format!("remu_{}", self.bytecode.position());
         let end_label = format!("remu_end_{}", self.bytecode.position());
 
