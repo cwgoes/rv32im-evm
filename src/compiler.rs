@@ -453,17 +453,40 @@ impl Compiler {
             Instruction::Beq { rs1, rs2, imm } => {
                 let target = pc.wrapping_add(*imm as u32);
                 let fallthrough = pc.wrapping_add(4);
-                self.emit_load_reg_pair(*rs1, *rs2);
-                self.t_binary_op(Opcode::Eq);
+                if *rs2 == 0 {
+                    // Optimization: beq rs, zero, target
+                    // Branch if rs == 0, use ISZERO to convert to condition
+                    self.emit_load_reg(*rs1);
+                    self.t_unary_op(Opcode::IsZero);
+                } else if *rs1 == 0 {
+                    // beq zero, rs, target -> same as beq rs, zero
+                    self.emit_load_reg(*rs2);
+                    self.t_unary_op(Opcode::IsZero);
+                } else {
+                    // General case: compare two registers
+                    self.emit_load_reg_pair(*rs1, *rs2);
+                    self.t_binary_op(Opcode::Eq);
+                }
                 self.emit_branch_with_cleanup(target, fallthrough);
             }
 
             Instruction::Bne { rs1, rs2, imm } => {
                 let target = pc.wrapping_add(*imm as u32);
                 let fallthrough = pc.wrapping_add(4);
-                self.emit_load_reg_pair(*rs1, *rs2);
-                self.t_binary_op(Opcode::Eq);
-                self.t_unary_op(Opcode::IsZero); // NOT equal
+                if *rs2 == 0 {
+                    // Optimization: bne rs, zero, target
+                    // JUMPI branches if condition != 0, so we can use rs directly
+                    self.emit_load_reg(*rs1);
+                    // rs value is already the condition (non-zero = branch)
+                } else if *rs1 == 0 {
+                    // bne zero, rs, target -> same as bne rs, zero
+                    self.emit_load_reg(*rs2);
+                } else {
+                    // General case: compare two registers
+                    self.emit_load_reg_pair(*rs1, *rs2);
+                    self.t_binary_op(Opcode::Eq);
+                    self.t_unary_op(Opcode::IsZero); // NOT equal
+                }
                 self.emit_branch_with_cleanup(target, fallthrough);
             }
 

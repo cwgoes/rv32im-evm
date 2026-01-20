@@ -17,6 +17,7 @@ This project compiles RISC-V rv32im (base integer + multiply/divide extension) b
 - **Low-bits register storage** - eliminates SHL/SHR for register access (~30% gas savings)
 - **Selective 32-bit masking** - only masks when overflow is possible
 - **Optimized memory access** - single MLOAD + BYTE extraction for word/halfword loads
+- **Branch vs zero optimization** - BNE/BEQ against zero skip unnecessary comparisons
 
 ## Usage
 
@@ -49,12 +50,12 @@ The benchmark compiles various mathematical functions from RISC-V assembly to EV
 
 | Function | Input | Result | Total Gas | Exec Gas |
 |----------|-------|--------|-----------|----------|
-| Factorial | 10! | 3,628,800 | 22,135 | 971 |
-| Fibonacci | fib(20) | 6,765 | 23,913 | 2,749 |
-| GCD | gcd(10000, 7777) | 1 | 22,473 | 1,309 |
-| Sum | 1+...+1000 | 500,500 | 108,233 | 87,069 |
-| Power | 2^10 | 1,024 | 22,155 | 991 |
-| Is Prime | 997 | prime | 26,449 | 5,274 |
+| Factorial | 10! | 3,628,800 | 22,113 | 949 |
+| Fibonacci | fib(20) | 6,765 | 23,871 | 2,707 |
+| GCD | gcd(10000, 7777) | 1 | 22,453 | 1,289 |
+| Sum | 1+...+1000 | 500,500 | 106,231 | 85,067 |
+| Power | 2^10 | 1,024 | 22,133 | 969 |
+| Is Prime | 997 | prime | 26,389 | 5,225 |
 
 *Exec Gas = Total Gas minus ~21k base overhead*
 
@@ -62,11 +63,11 @@ The benchmark compiles various mathematical functions from RISC-V assembly to EV
 
 | Loop Type | Gas/Iteration | Instructions/Iter | Gas/Instruction |
 |-----------|---------------|-------------------|-----------------|
-| Factorial (mul) | ~89 | 4 | ~22 |
-| Fibonacci (add) | ~133 | 6 | ~22 |
-| Sum (add) | ~87 | 4 | ~22 |
+| Factorial (mul) | ~87 | 4 | ~22 |
+| Fibonacci (add) | ~131 | 6 | ~22 |
+| Sum (add) | ~85 | 4 | ~21 |
 
-**Mean overhead: ~22 EVM gas per rv32im instruction**
+**Mean overhead: ~21-22 EVM gas per rv32im instruction**
 
 This overhead factor includes:
 - Register load/store operations (EVM memory access)
@@ -116,11 +117,11 @@ The SHA-256 benchmark demonstrates compiling cryptographic code from C to rv32im
 
 | Rounds | Total Gas | Gas/Round |
 |--------|-----------|-----------|
-| 1 | 50,381 | 50,381 |
-| 4 | 53,777 | 13,444 |
-| 16 | 67,361 | 4,210 |
-| 64 | 121,697 | 1,902 |
-| 256 | 339,041 | 1,324 |
+| 1 | 50,373 | 50,373 |
+| 4 | 53,745 | 13,436 |
+| 16 | 67,233 | 4,202 |
+| 64 | 121,185 | 1,894 |
+| 256 | 336,993 | 1,316 |
 
 The hand-assembled benchmark implements SHA-256-like operations:
 - ROTR (rotate right) using SRL + SLL + OR
