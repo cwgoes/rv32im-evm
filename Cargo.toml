@@ -1,0 +1,44 @@
+[package]
+name = "rv32im-evm"
+version = "0.1.0"
+edition = "2021"
+description = "RISC-V rv32im to Ethereum EVM compiler"
+license = "MIT"
+
+[dependencies]
+# EVM execution using revm (reth's EVM implementation)
+revm = { version = "19", default-features = false, features = ["std"] }
+
+# For binary parsing
+goblin = "0.8"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+
+# Hex encoding/decoding
+hex = "0.4"
+
+[dev-dependencies]
+# Testing
+pretty_assertions = "1"
+tempfile = "3"
+
+[[bin]]
+name = "rv32im-evm"
+path = "src/main.rs"
+
+[[bin]]
+name = "factorial-benchmark"
+path = "benches/factorial_benchmark.rs"
+
+[[bin]]
+name = "sha256-benchmark"
+path = "benches/sha256_benchmark.rs"
+
+[lib]
+name = "rv32im_evm"
+path = "src/lib.rs"

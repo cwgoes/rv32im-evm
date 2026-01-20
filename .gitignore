@@ -1,0 +1,18 @@
+# Rust build artifacts
+/target/
+
+# SHA256 benchmark build artifacts
+sha256-bench/*.elf
+sha256-bench/*.bin
+sha256-bench/*.hex
+sha256-bench/*.dump
+sha256-bench/src/*.o
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
