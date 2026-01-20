@@ -35,6 +35,10 @@ path = "src/main.rs"
 name = "factorial-benchmark"
 path = "benches/factorial_benchmark.rs"
 
+[[bin]]
+name = "sha256-benchmark"
+path = "benches/sha256_benchmark.rs"
+
 [lib]
 name = "rv32im_evm"
 path = "src/lib.rs"
