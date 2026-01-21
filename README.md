@@ -182,22 +182,34 @@ cargo run --bin meta_test --release
 
 The meta-compiled compiler is a full rv32im-to-EVM compiler running on the EVM itself.
 
-### Mathematical Functions Benchmark
+### On-Chain Compilation Benchmark
+
+This benchmark runs the meta-compiled compiler on the EVM and measures the gas cost of compiling rv32im programs:
 
 ```bash
 cargo run --bin meta_benchmark --release
 ```
 
-| Function | Result | Total Gas | Exec Gas | Gas/Iter |
-|----------|--------|-----------|----------|----------|
-| 10! | 3,628,800 | 22,038 | 873 | 87 |
-| fib(20) | 6,765 | 23,591 | 2,426 | 121 |
-| gcd(10000, 7777) | 1 | 22,346 | 1,181 | 196 |
-| 1+..+1000 | 500,500 | 95,266 | 74,101 | 74 |
-| 2^16 | 65,536 | 22,563 | 1,398 | 87 |
-| prime?(997) | 1 | 26,543 | 5,378 | 179 |
+| Program | RV Instr | Compile Gas | Execute Gas | Verified |
+|---------|----------|-------------|-------------|----------|
+| factorial(10) | 8 | 230,683 | 22,038 | OK |
+| fibonacci(20) | 11 | 230,830 | 23,591 | OK |
+| gcd(1071, 462) | 8 | 230,695 | 21,626 | OK |
+| sum(1..100) | 8 | 230,671 | 28,666 | OK |
+| power(2, 10) | 9 | 230,738 | 22,089 | OK |
+| is_prime(97) | 15 | 230,990 | 22,715 | OK |
 
-### Gas Cost Per Instruction
+### Compilation Gas Breakdown
+
+| Component | Gas Cost |
+|-----------|----------|
+| Fixed overhead (CREATE + init) | ~230,000 |
+| Marginal cost per rv32im instruction | ~46 |
+| Compile/Execute ratio | ~9.8x |
+
+The fixed overhead is dominated by deploying the 259KB compiler bytecode via CREATE. The marginal compilation cost is only ~46 gas per instruction.
+
+### Execution Gas Cost Per Instruction
 
 | Function | Instr/Iter | Gas/Iter | Gas/Instruction |
 |----------|------------|----------|-----------------|
@@ -208,7 +220,7 @@ cargo run --bin meta_benchmark --release
 | gcd | 5 | 189.1 | 37.8 |
 | is_prime | 6 | 131.6 | 21.9 |
 
-**Mean overhead: ~24 EVM gas per rv32im instruction**
+**Mean execution overhead: ~24 EVM gas per rv32im instruction**
 
 ## License
 

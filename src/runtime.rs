@@ -22,6 +22,8 @@ pub struct Runtime {
     initial_memory: Vec<u8>,
     /// Memory base offset in EVM
     mem_base: u32,
+    /// Calldata to pass to the contract
+    calldata: Vec<u8>,
 }
 
 impl Runtime {
@@ -31,12 +33,19 @@ impl Runtime {
             bytecode,
             initial_memory: Vec::new(),
             mem_base: 0x0100,
+            calldata: Vec::new(),
         }
     }
 
     /// Set the initial memory state
     pub fn with_memory(mut self, memory: Vec<u8>) -> Self {
         self.initial_memory = memory;
+        self
+    }
+
+    /// Set calldata to pass to the contract
+    pub fn with_calldata(mut self, calldata: Vec<u8>) -> Self {
+        self.calldata = calldata;
         self
     }
 
@@ -79,6 +88,9 @@ impl Runtime {
         };
         db.insert_account_info(contract_addr, account);
 
+        // Prepare calldata
+        let calldata = Bytes::from(self.calldata.clone());
+
         // Execute with or without tracing
         let result = if traced {
             let mut evm = Evm::builder()
@@ -86,7 +98,7 @@ impl Runtime {
                 .with_spec_id(SpecId::CANCUN)
                 .modify_tx_env(|tx| {
                     tx.transact_to = TxKind::Call(contract_addr);
-                    tx.data = Bytes::new();
+                    tx.data = calldata.clone();
                     tx.gas_limit = 1_000_000_000;
                     tx.gas_price = U256::from(0);
                 })
@@ -100,7 +112,7 @@ impl Runtime {
                 .with_spec_id(SpecId::CANCUN)
                 .modify_tx_env(|tx| {
                     tx.transact_to = TxKind::Call(contract_addr);
-                    tx.data = Bytes::new();
+                    tx.data = calldata.clone();
                     tx.gas_limit = 1_000_000_000;
                     tx.gas_price = U256::from(0);
                 })
