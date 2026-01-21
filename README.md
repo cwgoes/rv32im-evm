@@ -11,7 +11,8 @@ This project compiles RISC-V rv32im (base integer + multiply/divide extension) b
 - Full rv32im instruction set support (47 instructions)
 - Direct binary-to-bytecode compilation (no intermediate representation)
 - EVM Cancun spec support (uses PUSH0 for efficiency)
-- Comprehensive test suite (87 tests covering the rv32im spec)
+- Comprehensive test suite (89 tests covering the rv32im spec)
+- CSR instruction support (Zicsr extension)
 - **Optimized JUMPDEST emission** - only emits at actual jump targets
 - **Register DUP optimization** - uses DUP1 when same register is loaded twice consecutively
 - **Low-bits register storage** - eliminates SHL/SHR for register access (~30% gas savings)
@@ -68,7 +69,7 @@ The benchmark compiles various mathematical functions from RISC-V assembly to EV
 | Fibonacci (add) | ~109 | 6 | ~18 |
 | Sum (add) | ~71 | 4 | ~18 |
 
-**Mean overhead: ~18 EVM gas per rv32im instruction**
+**Mean overhead: ~18-24 EVM gas per rv32im instruction** (varies by instruction mix)
 
 This overhead factor includes:
 - Register load/store operations (optimized with DUP for hot registers in loops)
@@ -143,6 +144,83 @@ sudo apt install gcc-riscv64-unknown-elf
 # Build
 cd sha256-bench && make
 ```
+
+## Meta-Compilation
+
+This project includes a `no_std` version of the compiler (`rv32im-compiler-nostd`) that can itself be compiled to rv32im, enabling meta-compilation experiments.
+
+### Building the Meta-Compiler
+
+```bash
+# Install the rv32im target
+rustup target add riscv32im-unknown-none-elf
+
+# Build the no_std compiler for rv32im
+cd rv32im-compiler-nostd
+cargo build --target riscv32im-unknown-none-elf --release
+
+# Extract the text section
+llvm-objcopy --only-section=.text -O binary \
+  target/riscv32im-unknown-none-elf/release/rv32im-compiler \
+  target/rv32im-compiler-text.bin
+```
+
+### Running the Meta-Compilation Test
+
+```bash
+cargo run --bin meta-test --release
+```
+
+### Results
+
+| Metric | Value |
+|--------|-------|
+| RISC-V compiler size | 23,348 bytes (5,837 instructions) |
+| EVM bytecode size | 259,450 bytes |
+| Expansion ratio | 11.11x |
+| Bytes per instruction | 44.4 |
+
+The meta-compiled compiler is a full rv32im-to-EVM compiler running on the EVM itself.
+
+### On-Chain Compilation Benchmark
+
+This benchmark runs the meta-compiled compiler on the EVM and measures the gas cost of compiling rv32im programs:
+
+```bash
+cargo run --bin meta-benchmark --release
+```
+
+| Program | RV Instr | Compile Gas | Execute Gas | Verified |
+|---------|----------|-------------|-------------|----------|
+| factorial(10) | 8 | 230,683 | 22,038 | OK |
+| fibonacci(20) | 11 | 230,830 | 23,591 | OK |
+| gcd(1071, 462) | 8 | 230,695 | 21,626 | OK |
+| sum(1..100) | 8 | 230,671 | 28,666 | OK |
+| power(2, 10) | 9 | 230,738 | 22,089 | OK |
+| is_prime(97) | 15 | 230,990 | 22,715 | OK |
+
+### Compilation Gas Breakdown
+
+| Component | Gas Cost |
+|-----------|----------|
+| Fixed overhead (CREATE + init) | ~230,000 |
+| Marginal cost per rv32im instruction | ~46 |
+| Compile/Execute ratio | ~9.8x |
+
+The fixed overhead is dominated by deploying the 259KB compiler bytecode via CREATE. The marginal compilation cost is only ~46 gas per instruction.
+
+### Execution Gas Cost Per Instruction
+
+| Function | Instr/Iter | Gas/Iter | Gas/Instruction |
+|----------|------------|----------|-----------------|
+| factorial | 4 | 87.8 | 21.9 |
+| fibonacci | 6 | 121.6 | 20.3 |
+| sum | 4 | 74.4 | 18.6 |
+| power | 4 | 91.8 | 23.0 |
+| gcd | 5 | 189.1 | 37.8 |
+| is_prime | 6 | 131.6 | 21.9 |
+
+**Mean execution overhead: ~24 EVM gas per rv32im instruction**
 
 ## License
 

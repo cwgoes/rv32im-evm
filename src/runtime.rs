@@ -7,6 +7,9 @@ use revm::{
         Address, Bytes, ExecutionResult, Output, U256, Bytecode,
         AccountInfo, TxKind, SpecId,
     },
+    interpreter::analysis::to_analysed,
+    inspectors::CustomPrintTracer,
+    inspector_handle_register,
     Evm, InMemoryDB,
 };
 
@@ -19,6 +22,8 @@ pub struct Runtime {
     initial_memory: Vec<u8>,
     /// Memory base offset in EVM
     mem_base: u32,
+    /// Calldata to pass to the contract
+    calldata: Vec<u8>,
 }
 
 impl Runtime {
@@ -28,6 +33,7 @@ impl Runtime {
             bytecode,
             initial_memory: Vec::new(),
             mem_base: 0x0100,
+            calldata: Vec::new(),
         }
     }
 
@@ -37,16 +43,43 @@ impl Runtime {
         self
     }
 
+    /// Set calldata to pass to the contract
+    pub fn with_calldata(mut self, calldata: Vec<u8>) -> Self {
+        self.calldata = calldata;
+        self
+    }
+
+    /// Create analyzed bytecode with properly built jump table
+    fn create_analyzed_bytecode(&self) -> Bytecode {
+        // Create LegacyRaw bytecode
+        let raw = Bytecode::new_legacy(Bytes::from(self.bytecode.clone()));
+
+        // Explicitly analyze to build jump table
+        // This converts LegacyRaw -> LegacyAnalyzed with proper JumpTable
+        to_analysed(raw)
+    }
+
     /// Execute the program and return the result
     pub fn execute(&self) -> Result<ExecutionOutput, ExecutionError> {
+        self.execute_internal(false)
+    }
+
+    /// Execute with step-by-step tracing
+    pub fn execute_traced(&self) -> Result<ExecutionOutput, ExecutionError> {
+        self.execute_internal(true)
+    }
+
+    /// Internal execute with optional tracing
+    fn execute_internal(&self, traced: bool) -> Result<ExecutionOutput, ExecutionError> {
         // Create in-memory database
         let mut db = InMemoryDB::default();
 
         // Contract address
         let contract_addr = Address::from_slice(&[0x42; 20]);
 
-        // Deploy the bytecode as a contract
-        let bytecode = Bytecode::new_raw(Bytes::from(self.bytecode.clone()));
+        // Analyze bytecode to build jump table
+        let bytecode = self.create_analyzed_bytecode();
+
         let account = AccountInfo {
             balance: U256::ZERO,
             nonce: 0,
@@ -55,21 +88,39 @@ impl Runtime {
         };
         db.insert_account_info(contract_addr, account);
 
-        // Create EVM instance with Cancun spec (latest with PUSH0 support)
-        let mut evm = Evm::builder()
-            .with_db(db)
-            .with_spec_id(SpecId::CANCUN)
-            .modify_tx_env(|tx| {
-                tx.transact_to = TxKind::Call(contract_addr);
-                tx.data = Bytes::new();
-                tx.gas_limit = 1_000_000_000; // High gas limit for tests
-                tx.gas_price = U256::from(0);
-            })
-            .build();
+        // Prepare calldata
+        let calldata = Bytes::from(self.calldata.clone());
 
-        // Execute
-        let result = evm.transact_commit()
-            .map_err(|e| ExecutionError::EvmError(format!("{:?}", e)))?;
+        // Execute with or without tracing
+        let result = if traced {
+            let mut evm = Evm::builder()
+                .with_db(db)
+                .with_spec_id(SpecId::CANCUN)
+                .modify_tx_env(|tx| {
+                    tx.transact_to = TxKind::Call(contract_addr);
+                    tx.data = calldata.clone();
+                    tx.gas_limit = 1_000_000_000;
+                    tx.gas_price = U256::from(0);
+                })
+                .with_external_context(CustomPrintTracer::default())
+                .append_handler_register(inspector_handle_register)
+                .build();
+            evm.transact_commit()
+        } else {
+            let mut evm = Evm::builder()
+                .with_db(db)
+                .with_spec_id(SpecId::CANCUN)
+                .modify_tx_env(|tx| {
+                    tx.transact_to = TxKind::Call(contract_addr);
+                    tx.data = calldata.clone();
+                    tx.gas_limit = 1_000_000_000;
+                    tx.gas_price = U256::from(0);
+                })
+                .build();
+            evm.transact_commit()
+        };
+
+        let result = result.map_err(|e| ExecutionError::EvmError(format!("{:?}", e)))?;
 
         match result {
             ExecutionResult::Success { output, gas_used, .. } => {

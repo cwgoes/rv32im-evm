@@ -75,6 +75,14 @@ pub enum Instruction {
     Ecall,
     Ebreak,
 
+    // CSR instructions (Zicsr extension)
+    Csrrw { rd: u8, rs1: u8, csr: u16 },
+    Csrrs { rd: u8, rs1: u8, csr: u16 },
+    Csrrc { rd: u8, rs1: u8, csr: u16 },
+    Csrrwi { rd: u8, uimm: u8, csr: u16 },
+    Csrrsi { rd: u8, uimm: u8, csr: u16 },
+    Csrrci { rd: u8, uimm: u8, csr: u16 },
+
     // RV32M Standard Extension (Multiply/Divide)
     Mul { rd: u8, rs1: u8, rs2: u8 },
     Mulh { rd: u8, rs1: u8, rs2: u8 },
@@ -140,6 +148,12 @@ impl fmt::Display for Instruction {
             Instruction::Divu { rd, rs1, rs2 } => write!(f, "divu {}, {}, {}", REG_NAMES[*rd as usize], REG_NAMES[*rs1 as usize], REG_NAMES[*rs2 as usize]),
             Instruction::Rem { rd, rs1, rs2 } => write!(f, "rem {}, {}, {}", REG_NAMES[*rd as usize], REG_NAMES[*rs1 as usize], REG_NAMES[*rs2 as usize]),
             Instruction::Remu { rd, rs1, rs2 } => write!(f, "remu {}, {}, {}", REG_NAMES[*rd as usize], REG_NAMES[*rs1 as usize], REG_NAMES[*rs2 as usize]),
+            Instruction::Csrrw { rd, rs1, csr } => write!(f, "csrrw {}, {:#x}, {}", REG_NAMES[*rd as usize], csr, REG_NAMES[*rs1 as usize]),
+            Instruction::Csrrs { rd, rs1, csr } => write!(f, "csrrs {}, {:#x}, {}", REG_NAMES[*rd as usize], csr, REG_NAMES[*rs1 as usize]),
+            Instruction::Csrrc { rd, rs1, csr } => write!(f, "csrrc {}, {:#x}, {}", REG_NAMES[*rd as usize], csr, REG_NAMES[*rs1 as usize]),
+            Instruction::Csrrwi { rd, uimm, csr } => write!(f, "csrrwi {}, {:#x}, {}", REG_NAMES[*rd as usize], csr, uimm),
+            Instruction::Csrrsi { rd, uimm, csr } => write!(f, "csrrsi {}, {:#x}, {}", REG_NAMES[*rd as usize], csr, uimm),
+            Instruction::Csrrci { rd, uimm, csr } => write!(f, "csrrci {}, {:#x}, {}", REG_NAMES[*rd as usize], csr, uimm),
             Instruction::Unknown { raw } => write!(f, "unknown {:#010x}", raw),
         }
     }
@@ -296,12 +310,25 @@ pub fn decode_instruction(raw: u32) -> Instruction {
             Instruction::Fence { pred, succ }
         }
 
-        // SYSTEM (ECALL/EBREAK)
+        // SYSTEM (ECALL/EBREAK/CSR)
         0b1110011 => {
-            let imm = (raw >> 20) & 0xFFF;
-            match imm {
-                0 => Instruction::Ecall,
-                1 => Instruction::Ebreak,
+            let csr = ((raw >> 20) & 0xFFF) as u16;
+            let uimm = ((raw >> 15) & 0x1F) as u8;
+            match funct3 {
+                0b000 => {
+                    // ECALL/EBREAK
+                    match csr {
+                        0 => Instruction::Ecall,
+                        1 => Instruction::Ebreak,
+                        _ => Instruction::Unknown { raw },
+                    }
+                }
+                0b001 => Instruction::Csrrw { rd, rs1, csr },
+                0b010 => Instruction::Csrrs { rd, rs1, csr },
+                0b011 => Instruction::Csrrc { rd, rs1, csr },
+                0b101 => Instruction::Csrrwi { rd, uimm, csr },
+                0b110 => Instruction::Csrrsi { rd, uimm, csr },
+                0b111 => Instruction::Csrrci { rd, uimm, csr },
                 _ => Instruction::Unknown { raw },
             }
         }

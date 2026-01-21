@@ -41,7 +41,11 @@ fn run_program_debug(instructions: &[u32], debug: bool) -> u32 {
     }
 
     let runtime = Runtime::new(bytecode);
-    let output = runtime.execute().expect("Execution failed");
+    let output = if debug {
+        runtime.execute_traced().expect("Execution failed")
+    } else {
+        runtime.execute().expect("Execution failed")
+    };
     output.return_value
 }
 
@@ -802,6 +806,44 @@ fn test_jal_return_address() {
     assert_eq!(result, 0x80000004);
 }
 
+#[test]
+fn test_jalr_ret() {
+    // Test JAL + RET (JALR zero, ra, 0) pattern
+    // jal ra, 12     ; call subroutine at PC+12, ra = PC+4
+    // li a0, 99      ; fallback (shouldn't execute)
+    // ecall          ; fallback
+    // li a0, 42      ; subroutine: set return value
+    // jalr zero,ra,0 ; return
+    let result = run_program_debug(&[
+        jal(RA, 12),       // 0x00: call subroutine (ra = 0x80000004)
+        addi(A0, ZERO, 99), // 0x04: should not execute
+        ecall(),           // 0x08: should not execute
+        addi(A0, ZERO, 42), // 0x0c: subroutine
+        jalr(ZERO, RA, 0),  // 0x10: return to 0x80000004
+    ], true);
+    eprintln!("test_jalr_ret result: {}", result);
+    assert_eq!(result, 99); // Should return after jalr back to 0x04
+}
+
+#[test]
+fn test_jalr_simple() {
+    // Simple JALR test: compute address and jump
+    // li t0, 0x8000000c ; target address
+    // jalr zero, t0, 0  ; jump to target
+    // li a0, 99         ; skipped
+    // li a0, 42         ; target
+    // ecall
+    let result = run_program_debug(&[
+        lui(T0, 0x80000000u32 as i32),  // 0x00: t0 = 0x80000000
+        addi(T0, T0, 0x10),              // 0x04: t0 = 0x80000010
+        jalr(ZERO, T0, 0),               // 0x08: jump to 0x80000010
+        addi(A0, ZERO, 99),              // 0x0c: skipped
+        addi(A0, ZERO, 42),              // 0x10: target
+        ecall(),                         // 0x14
+    ], true);
+    assert_eq!(result, 42);
+}
+
 // ============================================================
 // RV32M Multiply/Divide Tests
 // ============================================================
@@ -1281,64 +1323,88 @@ fn test_decode_ecall() {
     assert!(matches!(instr, Instruction::Ecall));
 }
 
+// Debug test: understand memory initialization issue
 #[test]
-fn test_debug_bytecode() {
-    // Simple test: just return 42
-    let mut program = Vec::new();
-    program.extend_from_slice(&addi(A0, ZERO, 42).to_le_bytes());
-    program.extend_from_slice(&ecall().to_le_bytes());
-
-    let mut compiler = test_compiler();
-    let bytecode = compiler.compile(&program).expect("Compilation failed");
-
-    eprintln!("Simple program bytecode length: {} bytes", bytecode.len());
-
-    let runtime = Runtime::new(bytecode);
-    let output = runtime.execute().expect("Execution failed");
-    assert_eq!(output.return_value, 42);
-}
-
-#[test]
-fn test_debug_branch() {
-    // Test SLT (set less than) which uses EQ-like comparison
-    // This tests if register comparison works correctly
-    let instrs = [
-        addi(T0, ZERO, 5),   // 0: t0 = 5
-        addi(T1, ZERO, 6),   // 1: t1 = 6
-        slt(A0, T0, T1),     // 2: a0 = (t0 < t1) = 1
-        ecall(),             // 3
+fn test_memory_init_issue() {
+    // Test with negative offset: lw a0, -1024(a1) where a1 = 0x80001000
+    // This should load from address 0x80000C00
+    let program: Vec<u8> = vec![
+        // lui a1, 0x80001  -> a1 = 0x80001000
+        0xb7, 0x15, 0x00, 0x80,
+        // lw a0, -1024(a1) -> load from 0x80000C00
+        0x03, 0xa5, 0x05, 0xc0,
+        // ecall
+        0x73, 0x00, 0x00, 0x00,
     ];
 
-    eprintln!("\n=== SLT Test ===");
+    // First, compile and run WITHOUT initial_memory to see if it works
+    let config_no_init = CompilerConfig {
+        load_address: 0x80000000,
+        stack_pointer: 0x80010000,
+        memory_size: 0x20000,
+        initial_memory: vec![],
+        ..Default::default()
+    };
 
-    // Decode and print each instruction
-    for (i, &raw) in instrs.iter().enumerate() {
-        let decoded = decode_instruction(raw);
-        eprintln!("Instr {}: {:#010x} -> {}", i, raw, decoded);
-    }
+    let mut compiler1 = Compiler::with_config(config_no_init);
+    let bytecode1 = compiler1.compile(&program).expect("Compilation failed");
 
-    let mut program = Vec::new();
-    for instr in &instrs {
-        program.extend_from_slice(&instr.to_le_bytes());
-    }
+    eprintln!("Without init memory - bytecode len: {}", bytecode1.len());
+    eprintln!("Without init memory - bytecode: {}", hex::encode(&bytecode1));
 
-    let mut compiler = test_compiler();
-    let bytecode = compiler.compile(&program).expect("Compilation failed");
+    let runtime1 = Runtime::new(bytecode1);
+    let output1 = runtime1.execute().expect("Should work without init memory");
+    eprintln!("Without init memory - result: {:#x}", output1.return_value);
+    // Should return 0 since memory is uninitialized
 
-    eprintln!("Bytecode length: {} bytes", bytecode.len());
-    eprintln!("Bytecode hex: {}", hex::encode(&bytecode[0..100.min(bytecode.len())]));
+    // Now with initial_memory
+    let config_with_init = CompilerConfig {
+        load_address: 0x80000000,
+        stack_pointer: 0x80010000,
+        memory_size: 0x20000,
+        initial_memory: vec![(0x80000C00, vec![0x42, 0x42, 0x42, 0x42])],
+        ..Default::default()
+    };
+
+    let mut compiler2 = Compiler::with_config(config_with_init);
+    let bytecode2 = compiler2.compile(&program).expect("Compilation failed");
+
+    eprintln!("With init memory - bytecode len: {}", bytecode2.len());
+    eprintln!("With init memory - bytecode: {}", hex::encode(&bytecode2));
+
+    let runtime2 = Runtime::new(bytecode2);
+    let output2 = runtime2.execute().expect("Should work with init memory");
+    assert_eq!(output2.return_value, 0x42424242);
+}
+
+// Test running simple_test.bin compiled from C
+#[test]
+fn test_simple_test_binary() {
+    let simple_test_bin = include_bytes!("../meta/simple_test.bin");
+    eprintln!("Simple test size: {} bytes ({} instructions)",
+             simple_test_bin.len(), simple_test_bin.len() / 4);
+
+    // The simple_test.c reads from 0x80000C00 and returns the value
+    let config = CompilerConfig {
+        load_address: 0x80000000,
+        stack_pointer: 0x80020000,
+        memory_size: 0x40000,
+        initial_memory: vec![
+            (0x80000C00, vec![0x42, 0x42, 0x42, 0x42]),  // Value to read: 0x42424242
+        ],
+        ..Default::default()
+    };
+
+    let mut compiler = Compiler::with_config(config);
+    let bytecode = compiler.compile(simple_test_bin.as_ref()).expect("Compilation failed");
+
+    eprintln!("EVM bytecode size: {} bytes", bytecode.len());
 
     let runtime = Runtime::new(bytecode);
-    let result = runtime.execute();
+    let result = runtime.execute().expect("Execution failed");
 
-    match result {
-        Ok(output) => {
-            eprintln!("Result: {} (expected 1)", output.return_value);
-            assert_eq!(output.return_value, 1);
-        }
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            panic!("Execution failed: {}", e);
-        }
-    }
+    eprintln!("Result: 0x{:08x} (expected 0x42424242)", result.return_value);
+    eprintln!("Gas used: {}", result.gas_used);
+
+    assert_eq!(result.return_value, 0x42424242);
 }

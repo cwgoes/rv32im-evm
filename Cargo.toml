@@ -9,6 +9,9 @@ license = "MIT"
 # EVM execution using revm (reth's EVM implementation)
 revm = { version = "19", default-features = false, features = ["std"] }
 
+# Bitvec for jump table (matches revm's internal version)
+bitvec = "1"
+
 # For binary parsing
 goblin = "0.8"
 
@@ -38,6 +41,14 @@ path = "benches/factorial_benchmark.rs"
 [[bin]]
 name = "sha256-benchmark"
 path = "benches/sha256_benchmark.rs"
+
+[[bin]]
+name = "meta-benchmark"
+path = "src/bin/meta_benchmark.rs"
+
+[[bin]]
+name = "meta-test"
+path = "src/bin/meta_test.rs"
 
 [lib]
 name = "rv32im_evm"
