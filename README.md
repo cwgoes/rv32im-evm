@@ -168,7 +168,7 @@ llvm-objcopy --only-section=.text -O binary \
 ### Running the Meta-Compilation Test
 
 ```bash
-cargo run --bin meta_test --release
+cargo run --bin meta-test --release
 ```
 
 ### Results
@@ -187,7 +187,7 @@ The meta-compiled compiler is a full rv32im-to-EVM compiler running on the EVM i
 This benchmark runs the meta-compiled compiler on the EVM and measures the gas cost of compiling rv32im programs:
 
 ```bash
-cargo run --bin meta_benchmark --release
+cargo run --bin meta-benchmark --release
 ```
 
 | Program | RV Instr | Compile Gas | Execute Gas | Verified |

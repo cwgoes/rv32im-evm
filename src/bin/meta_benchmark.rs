@@ -10,25 +10,22 @@ use rv32im_evm::compiler::{Compiler, CompilerConfig};
 use rv32im_evm::runtime::Runtime;
 use std::fs;
 
-// EVM opcodes
+// EVM opcodes used in wrapper bytecode
 const PUSH0: u8 = 0x5F;
 const PUSH1: u8 = 0x60;
 const PUSH2: u8 = 0x61;
 const PUSH3: u8 = 0x62;
-const PUSH20: u8 = 0x73;
 const DUP1: u8 = 0x80;
-const DUP2: u8 = 0x81;
 const MSTORE: u8 = 0x52;
 const MLOAD: u8 = 0x51;
 const CALLDATASIZE: u8 = 0x36;
 const CALLDATACOPY: u8 = 0x37;
 const CODECOPY: u8 = 0x39;
-const CODESIZE: u8 = 0x38;
 const CREATE: u8 = 0xF0;
-const CALL: u8 = 0xF1;
 const RETURN: u8 = 0xF3;
 const GAS: u8 = 0x5A;
-const JUMPDEST: u8 = 0x5B;
+const DELEGATECALL: u8 = 0xF4;
+const POP: u8 = 0x50;
 
 // EVM memory addresses for the meta-compiled compiler
 // These correspond to RISC-V addresses after the compiler's memory translation:
@@ -263,13 +260,12 @@ fn create_deploy_and_call_bytecode(compiler_bytecode: &[u8]) -> Vec<u8> {
     // GAS (all remaining gas)
     wrapper.push(GAS);
 
-    // DELEGATECALL = 0xF4
-    wrapper.push(0xF4);
+    // DELEGATECALL
+    wrapper.push(DELEGATECALL);
 
     // Stack: [success]
     // Pop success (we ignore it for now)
-    // POP = 0x50
-    wrapper.push(0x50);
+    wrapper.push(POP);
 
     // === Part 5: Return the result ===
     // The meta-compiler puts output length in a0 and returns via RETURN
@@ -582,13 +578,11 @@ fn main() {
     println!("│ Program           │ RV Ins │ Compile Gas  │ Execute Gas  │ Verify       │");
     println!("├───────────────────┼────────┼──────────────┼──────────────┼──────────────┤");
 
-    let mut total_rv_instr = 0usize;
     let mut total_compile_gas = 0u64;
     let mut total_exec_gas = 0u64;
     let mut all_verified = true;
 
     for r in &results {
-        total_rv_instr += r.rv_instr;
         total_compile_gas += r.compile_gas;
         total_exec_gas += r.exec_gas;
         if !r.verified {
@@ -616,7 +610,6 @@ fn main() {
     println!("    Fixed overhead:      {:>10.0} gas (CREATE + init)", fixed_overhead);
     println!("    Marginal cost:       {:>10.1} gas/instruction\n", marginal_gas);
 
-    let mean_compile = total_compile_gas as f64 / total_rv_instr as f64;
     let mean_exec = total_exec_gas as f64 / results.len() as f64;
 
     println!("  GAS COST COMPARISON:");

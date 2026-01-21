@@ -44,7 +44,11 @@ path = "benches/sha256_benchmark.rs"
 
 [[bin]]
 name = "meta-benchmark"
-path = "benches/meta_benchmark.rs"
+path = "src/bin/meta_benchmark.rs"
+
+[[bin]]
+name = "meta-test"
+path = "src/bin/meta_test.rs"
 
 [lib]
 name = "rv32im_evm"
