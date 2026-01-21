@@ -11,7 +11,8 @@ This project compiles RISC-V rv32im (base integer + multiply/divide extension) b
 - Full rv32im instruction set support (47 instructions)
 - Direct binary-to-bytecode compilation (no intermediate representation)
 - EVM Cancun spec support (uses PUSH0 for efficiency)
-- Comprehensive test suite (87 tests covering the rv32im spec)
+- Comprehensive test suite (89 tests covering the rv32im spec)
+- CSR instruction support (Zicsr extension)
 - **Optimized JUMPDEST emission** - only emits at actual jump targets
 - **Register DUP optimization** - uses DUP1 when same register is loaded twice consecutively
 - **Low-bits register storage** - eliminates SHL/SHR for register access (~30% gas savings)
@@ -143,6 +144,42 @@ sudo apt install gcc-riscv64-unknown-elf
 # Build
 cd sha256-bench && make
 ```
+
+## Meta-Compilation
+
+This project includes a `no_std` version of the compiler (`rv32im-compiler-nostd`) that can itself be compiled to rv32im, enabling meta-compilation experiments.
+
+### Building the Meta-Compiler
+
+```bash
+# Install the rv32im target
+rustup target add riscv32im-unknown-none-elf
+
+# Build the no_std compiler for rv32im
+cd rv32im-compiler-nostd
+cargo build --target riscv32im-unknown-none-elf --release
+
+# Extract the text section
+llvm-objcopy --only-section=.text -O binary \
+  target/riscv32im-unknown-none-elf/release/rv32im-compiler \
+  target/rv32im-compiler-text.bin
+```
+
+### Running the Meta-Compilation Test
+
+```bash
+cargo run --bin meta_test --release
+```
+
+### Results
+
+| Metric | Value |
+|--------|-------|
+| RISC-V compiler size | 23,348 bytes (5,837 instructions) |
+| EVM bytecode size | 259,450 bytes |
+| Expansion ratio | 11.11x |
+
+The meta-compiled compiler is a full rv32im-to-EVM compiler running on the EVM itself.
 
 ## License
 
