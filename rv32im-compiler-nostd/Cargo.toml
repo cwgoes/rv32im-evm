@@ -1,0 +1,25 @@
+[package]
+name = "rv32im-compiler-nostd"
+version = "0.1.0"
+edition = "2021"
+description = "RISC-V rv32im to EVM compiler (no_std version)"
+
+[features]
+default = []
+
+[dependencies]
+# No dependencies - pure no_std implementation
+
+[lib]
+name = "rv32im_compiler_nostd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rv32im-compiler"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"      # Optimize for size
+lto = true           # Link-time optimization
+panic = "abort"      # Abort on panic (smaller binary)
+codegen-units = 1    # Single codegen unit for better optimization

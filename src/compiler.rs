@@ -346,6 +346,18 @@ impl LoopInfo {
                 (vec![], vec![])
             }
 
+            // CSR instructions
+            Instruction::Csrrw { rd, rs1, .. } |
+            Instruction::Csrrs { rd, rs1, .. } |
+            Instruction::Csrrc { rd, rs1, .. } => {
+                (vec![*rs1], vec![*rd])
+            }
+            Instruction::Csrrwi { rd, .. } |
+            Instruction::Csrrsi { rd, .. } |
+            Instruction::Csrrci { rd, .. } => {
+                (vec![], vec![*rd])
+            }
+
             Instruction::Unknown { .. } => (vec![], vec![]),
         }
     }
@@ -1267,6 +1279,18 @@ impl Compiler {
                     // Unsigned remainder
                     self.emit_unsigned_rem(*rs1, *rs2);
                     self.emit_store_reg(*rd);
+                }
+            }
+
+            // CSR instructions - no-op on EVM (just store 0 to rd if rd != 0)
+            Instruction::Csrrw { rd, .. } |
+            Instruction::Csrrs { rd, .. } |
+            Instruction::Csrrc { rd, .. } |
+            Instruction::Csrrwi { rd, .. } |
+            Instruction::Csrrsi { rd, .. } |
+            Instruction::Csrrci { rd, .. } => {
+                if *rd != 0 {
+                    self.emit_store_reg_imm(*rd, 0);
                 }
             }
 
