@@ -69,7 +69,7 @@ The benchmark compiles various mathematical functions from RISC-V assembly to EV
 | Fibonacci (add) | ~109 | 6 | ~18 |
 | Sum (add) | ~71 | 4 | ~18 |
 
-**Mean overhead: ~18 EVM gas per rv32im instruction**
+**Mean overhead: ~18-24 EVM gas per rv32im instruction** (varies by instruction mix)
 
 This overhead factor includes:
 - Register load/store operations (optimized with DUP for hot registers in loops)
@@ -178,8 +178,37 @@ cargo run --bin meta_test --release
 | RISC-V compiler size | 23,348 bytes (5,837 instructions) |
 | EVM bytecode size | 259,450 bytes |
 | Expansion ratio | 11.11x |
+| Bytes per instruction | 44.4 |
 
 The meta-compiled compiler is a full rv32im-to-EVM compiler running on the EVM itself.
+
+### Mathematical Functions Benchmark
+
+```bash
+cargo run --bin meta_benchmark --release
+```
+
+| Function | Result | Total Gas | Exec Gas | Gas/Iter |
+|----------|--------|-----------|----------|----------|
+| 10! | 3,628,800 | 22,038 | 873 | 87 |
+| fib(20) | 6,765 | 23,591 | 2,426 | 121 |
+| gcd(10000, 7777) | 1 | 22,346 | 1,181 | 196 |
+| 1+..+1000 | 500,500 | 95,266 | 74,101 | 74 |
+| 2^16 | 65,536 | 22,563 | 1,398 | 87 |
+| prime?(997) | 1 | 26,543 | 5,378 | 179 |
+
+### Gas Cost Per Instruction
+
+| Function | Instr/Iter | Gas/Iter | Gas/Instruction |
+|----------|------------|----------|-----------------|
+| factorial | 4 | 87.8 | 21.9 |
+| fibonacci | 6 | 121.6 | 20.3 |
+| sum | 4 | 74.4 | 18.6 |
+| power | 4 | 91.8 | 23.0 |
+| gcd | 5 | 189.1 | 37.8 |
+| is_prime | 6 | 131.6 | 21.9 |
+
+**Mean overhead: ~24 EVM gas per rv32im instruction**
 
 ## License
 
